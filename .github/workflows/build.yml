@@ -1,0 +1,49 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache GStreamer MSIs
+        id: gst-cache
+        uses: actions/cache@v4
+        with:
+          path: gst-msi
+          key: gstreamer-msvc-1.26.11
+
+      - name: Download GStreamer MSIs
+        if: steps.gst-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory gst-msi | Out-Null
+          curl.exe -sL -o gst-msi/runtime.msi https://gstreamer.freedesktop.org/data/pkg/windows/1.26.11/msvc/gstreamer-1.0-msvc-x86_64-1.26.11.msi
+          curl.exe -sL -o gst-msi/devel.msi https://gstreamer.freedesktop.org/data/pkg/windows/1.26.11/msvc/gstreamer-1.0-devel-msvc-x86_64-1.26.11.msi
+
+      - name: Install GStreamer
+        shell: pwsh
+        run: |
+          $p1 = Start-Process msiexec -ArgumentList '/i',"$PWD\gst-msi\runtime.msi",'/qn','/norestart','ADDLOCAL=ALL' -Wait -PassThru
+          $p2 = Start-Process msiexec -ArgumentList '/i',"$PWD\gst-msi\devel.msi",'/qn','/norestart','ADDLOCAL=ALL' -Wait -PassThru
+          if ($p1.ExitCode -ne 0 -or $p2.ExitCode -ne 0) { exit 1 }
+
+      # Builds against the vendored SDK snapshot in sdk/ - no access to the
+      # (private) vkrender repo required.
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vkr_airplay-win64
+          path: |
+            build/Release/vkr_airplay.exe
+            build/Release/vkrender_client.dll
