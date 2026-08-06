@@ -32,6 +32,21 @@ redials).
 - Crash triage built in: faults print module+offset before exit
   (`VKR_AIRPLAY_DEBUG=1` for protocol-level logs).
 
+## PIN authorization (optional)
+
+Set `VKR_PIN` before starting the receiver:
+
+- `VKR_PIN=auto` — the RAOP core mints a fresh 4-digit code per pairing
+- `VKR_PIN=1234` — a fixed code
+- unset / `off` — no PIN (open receiver)
+
+The receiver then advertises `pw=true`, so Apple devices run the AirPlay
+`pair-pin` exchange: the code appears as a topmost overlay on this machine's
+screen and the user types it into the sender's password prompt. The overlay
+disappears once mirror frames start flowing. The same overlay is used by the
+Miracast and WebRTC receivers in the main vkrender project, so all three
+modalities look identical on screen.
+
 ## Build
 
 Prereqs: Visual Studio (MSVC), CMake, and the GStreamer **MSVC x86_64**

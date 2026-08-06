@@ -83,7 +83,7 @@ target_compile_options(raop_static PRIVATE /w) # third-party C stays quiet
 
 # ---- the receiver -----------------------------------------------------------
 # OpenSSL FILE* BIOs cross the DLL boundary -> applink.c must live in the exe.
-add_executable(vkr_airplay src/airplay_win.cpp
+add_executable(vkr_airplay src/airplay_win.cpp src/pin_overlay.cpp
     "${GST_ROOT}/include/openssl/applink.c")
 target_include_directories(vkr_airplay PRIVATE ${UX} "${VKRENDER_SDK_DIR}"
     "${GST_ROOT}/include")

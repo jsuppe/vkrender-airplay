@@ -39,6 +39,7 @@ extern "C" {
 #include "stream.h"
 }
 
+#include "pin_overlay.h"
 #include "vkrender_client.h"
 
 using Microsoft::WRL::ComPtr;
@@ -60,6 +61,8 @@ std::atomic<bool> g_pipelineReady{false};
 // sender stops mirroring - observed live). Reconnected lazily on the next
 // session's first decoded frame, at the mirror's true resolution.
 std::atomic<bool> g_sessionEnded{false};
+// M25: true while the pairing PIN overlay is up (hidden once media flows).
+std::atomic<bool> g_pinShowing{false};
 
 // ---- GStreamer decode: H.264 AUs -> BGRA frames -> vkrClient ring ----------
 
@@ -150,8 +153,18 @@ void pumpDecodedFrames() {
 
 // ---- raop callbacks (invoked on raop threads) ------------------------------
 
+// M25: the core ran pair-pin-start and wants this code shown on our screen;
+// the user types it into the Apple device's password prompt.
+void cbDisplayPin(void*, char* pin) {
+    printf("airplay: PIN required - showing %s on screen\n", pin ? pin : "?");
+    g_pinShowing = true;
+    vkr::pinOverlayShow(pin ? pin : "", "AirPlay");
+}
+
 void cbVideoProcess(void*, raop_ntp_t*, h264_decode_struct* data) {
     if (!g_pipelineReady || data->data_len <= 0) return;
+    // Authorized: the mirror is flowing, so the code is no longer needed.
+    if (g_pinShowing.exchange(false)) vkr::pinOverlayHide();
     GstBuffer* buf = gst_buffer_new_allocate(nullptr, data->data_len, nullptr);
     gst_buffer_fill(buf, 0, data->data, data->data_len);
     gst_app_src_push_buffer(GST_APP_SRC(g_appsrc), buf); // takes ownership
@@ -233,7 +246,11 @@ int main(int argc, char** argv) {
         hw[0] = (hw[0] | 0x02) & ~0x01;
     }
 
-    g_dnssd = dnssd_init(name, (int)strlen(name), (const char*)hw, 6, &error, 0);
+    // M25: optional PIN. require_pw advertises `pw=true` in the RAOP/AirPlay
+    // TXT records, so Apple senders run the pair-pin exchange and the core
+    // calls display_pin with the code to show on this screen.
+    const bool usePin = vkr::pinEnabled();
+    g_dnssd = dnssd_init(name, (int)strlen(name), (const char*)hw, 6, &error, usePin ? 1 : 0);
     if (!g_dnssd) {
         fprintf(stderr, "airplay: dnssd_init failed (%d)\n", error);
         return 1;
@@ -251,6 +268,7 @@ int main(int argc, char** argv) {
     cbs.report_client_request = cbReportClient;
     cbs.video_pause = cbVideoPause;
     cbs.video_resume = cbVideoResume;
+    if (usePin) cbs.display_pin = cbDisplayPin;
 
     g_raop = raop_init(&cbs);
     if (!g_raop) {
@@ -275,6 +293,13 @@ int main(int argc, char** argv) {
     raop_set_plist(g_raop, "maxFPS", 30);
     raop_set_plist(g_raop, "overscanned", 0);
     raop_set_plist(g_raop, "max_ntp_timeouts", 5);
+    // A fixed VKR_PIN pins the code (the core mints a random one per pairing
+    // in auto mode); values <= 9999 are used verbatim by the pair-pin flow.
+    if (usePin) {
+        std::string fixed = vkr::pinForConnection();
+        if (!fixed.empty() && getenv("VKR_PIN") && strcmp(getenv("VKR_PIN"), "auto") != 0)
+            raop_set_plist(g_raop, "pin", atoi(fixed.c_str()));
+    }
 
     unsigned short port = 0;
     if (raop_start(g_raop, &port) <= 0) { // httpd_start returns 1 on success
