@@ -192,7 +192,7 @@ raop_handler_pairpinstart(raop_conn_t *conn,
     char pin[6];
     snprintf(pin, 5, "%04u", pin_4);
     if (conn->raop->callbacks.display_pin) {
-         conn->raop->callbacks.display_pin(conn->raop->callbacks.cls, pin);
+         conn->callbacks.display_pin(conn->callbacks.cls, pin);
     }
     logger_log(conn->raop->logger, LOGGER_INFO, "*** CLIENT MUST NOW ENTER PIN = \"%s\" AS AIRPLAY PASSWORD", pin);
     *response_data = NULL;
@@ -581,7 +581,7 @@ raop_handler_setup(raop_conn_t *conn,
         plist_t req_name_node = plist_dict_get_item(req_root_node, "name");
         plist_get_string_val(req_name_node, &name);  
 	if (conn->raop->callbacks.report_client_request) {
-            conn->raop->callbacks.report_client_request(conn->raop->callbacks.cls, deviceID, model, name, &admit_client);
+            conn->callbacks.report_client_request(conn->callbacks.cls, deviceID, model, name, &admit_client);
         }
 	if (admit_client && deviceID && name && conn->raop->callbacks.register_client) {
             bool pending_registration;
@@ -759,9 +759,12 @@ raop_handler_setup(raop_conn_t *conn,
             conn->raop_ntp = raop_ntp_init(conn->raop->logger, &conn->raop->callbacks, remote,
                                            conn->remotelen, (unsigned short) timing_rport, &time_protocol);
             raop_ntp_start(conn->raop_ntp, &timing_lport, conn->raop->max_ntp_timeouts);
-            conn->raop_rtp = raop_rtp_init(conn->raop->logger, &conn->raop->callbacks, conn->raop_ntp,
+            /* vkrender: per-connection callbacks, so this sender's frames
+               reach ITS OWN decode pipeline. Both take a copy, so each
+               session's video_process gets its own `cls`. */
+            conn->raop_rtp = raop_rtp_init(conn->raop->logger, &conn->callbacks, conn->raop_ntp,
                                            remote, conn->remotelen, aeskey, aesiv);
-            conn->raop_rtp_mirror = raop_rtp_mirror_init(conn->raop->logger, &conn->raop->callbacks,
+            conn->raop_rtp_mirror = raop_rtp_mirror_init(conn->raop->logger, &conn->callbacks,
                                                          conn->raop_ntp, remote, conn->remotelen, aeskey);
         }
 
@@ -860,7 +863,7 @@ raop_handler_setup(raop_conn_t *conn,
                             usingScreen = false;
                         }
 
-                        conn->raop->callbacks.audio_get_format(conn->raop->callbacks.cls, &ct, &spf, &usingScreen, &isMedia, &audioFormat);
+                        conn->callbacks.audio_get_format(conn->callbacks.cls, &ct, &spf, &usingScreen, &isMedia, &audioFormat);
                     }
 
                     if (conn->raop_rtp) {
@@ -1070,7 +1073,7 @@ raop_handler_teardown(raop_conn_t *conn,
     }
     plist_free(req_root_node);
     if (conn->raop->callbacks.conn_teardown) {
-        conn->raop->callbacks.conn_teardown(conn->raop->callbacks.cls, &teardown_96, &teardown_110);
+        conn->callbacks.conn_teardown(conn->callbacks.cls, &teardown_96, &teardown_110);
     }
     logger_log(conn->raop->logger, LOGGER_DEBUG, "TEARDOWN request,  96=%d, 110=%d", teardown_96, teardown_110);
   

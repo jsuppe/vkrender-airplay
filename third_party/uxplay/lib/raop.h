@@ -39,6 +39,22 @@ typedef void (*raop_log_callback_t)(void *cls, int level, const char *msg);
 struct raop_callbacks_s {
     void* cls;
 
+    /* vkrender multi-session support.
+     *
+     * Upstream passes ONE global `cls` to every callback, so a receiver cannot
+     * tell which sender a frame belongs to - which is why AirPlay was limited
+     * to a single presenter while every other vkrender ingress is
+     * multi-producer. If session_init is set, raop calls it once per
+     * connection and hands the result back as `cls` to that connection's
+     * callbacks (including the mirror's video_process), letting the receiver
+     * keep a decode pipeline and a scene ring PER SENDER.
+     *
+     * Leave both NULL for the old single-session behaviour: `cls` then stays
+     * the global pointer everywhere, so the Android/Linux builds are
+     * unaffected. */
+    void* (*session_init)(void *cls);
+    void  (*session_destroy)(void *session);
+
     void  (*audio_process)(void *cls, raop_ntp_t *ntp, audio_decode_struct *data);
     void  (*video_process)(void *cls, raop_ntp_t *ntp, h264_decode_struct *data);
     void  (*video_pause)(void *cls);

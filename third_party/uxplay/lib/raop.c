@@ -97,6 +97,13 @@ struct raop_conn_s {
        on a single mistyped PIN. conn_request owns the response, so it rebuilds
        it after the handler returns. */
     bool auth_failed;
+
+    /* vkrender: this connection's own view of the callbacks - identical to
+       raop->callbacks except that `cls` is the per-session pointer from
+       session_init. Everything that belongs to ONE sender (the mirror's
+       video_process above all) must go through this, not raop->callbacks, or
+       two senders end up sharing one decode pipeline. */
+    raop_callbacks_t callbacks;
 };
 typedef struct raop_conn_s raop_conn_t;
 
@@ -162,9 +169,30 @@ conn_init(void *opaque, unsigned char *local, int locallen, unsigned char *remot
     conn->locallen = locallen;
     conn->remotelen = remotelen;
     conn->have_active_remote = false;
-    
+
+    /* vkrender: give this connection its own callbacks whose `cls` is a
+       per-session object. Without session_init the copy is identical to the
+       global one, so single-session builds behave exactly as before. */
+    conn->callbacks = raop->callbacks;
+    if (raop->callbacks.session_init) {
+        void *session = raop->callbacks.session_init(raop->callbacks.cls);
+        if (!session) {
+            /* The receiver refused this sender (no free slot). Failing here
+               makes httpd drop the connection immediately, so the sender sees
+               an error instead of the indefinite spinner it used to get when
+               the core simply stopped accepting. */
+            pairing_session_destroy(conn->session);
+            fairplay_destroy(conn->fairplay);
+            free(conn->local);
+            free(conn->remote);
+            free(conn);
+            return NULL;
+        }
+        conn->callbacks.cls = session;
+    }
+
     if (raop->callbacks.conn_init) {
-        raop->callbacks.conn_init(raop->callbacks.cls);
+        conn->callbacks.conn_init(conn->callbacks.cls);
     }
 
     return conn;
@@ -339,7 +367,7 @@ conn_destroy(void *ptr) {
     logger_log(conn->raop->logger, LOGGER_DEBUG, "Destroying connection");
 
     if (conn->raop->callbacks.conn_destroy) {
-        conn->raop->callbacks.conn_destroy(conn->raop->callbacks.cls);
+        conn->callbacks.conn_destroy(conn->callbacks.cls);
     }
 
     if (conn->raop_rtp) {
@@ -355,7 +383,15 @@ conn_destroy(void *ptr) {
     }
 
     if (conn->raop->callbacks.video_flush) {
-        conn->raop->callbacks.video_flush(conn->raop->callbacks.cls);
+        conn->callbacks.video_flush(conn->callbacks.cls);
+    }
+
+    /* vkrender: tear the per-sender session down LAST, once nothing above can
+       still call into it. Its decode pipeline and scene ring die with it, so
+       the tile leaves the scene when this sender stops mirroring. */
+    if (conn->raop->callbacks.session_destroy &&
+        conn->callbacks.cls != conn->raop->callbacks.cls) {
+        conn->raop->callbacks.session_destroy(conn->callbacks.cls);
     }
 
     free(conn->local);
