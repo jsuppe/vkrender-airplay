@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <random>
@@ -133,13 +134,27 @@ void uiThread() {
     wc.lpfnWndProc = wndProc;
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = kClass;
-    RegisterClassExW(&wc);
+    // Diagnostics, not decoration: the overlay silently failed to appear on a
+    // real cast and the failure was invisible - display_pin fired, this thread
+    // ran, and no window ever existed. A bare `return` on failure gave nothing
+    // to go on, so report WHY.
+    if (!RegisterClassExW(&wc)) {
+        DWORD e = GetLastError();
+        // ERROR_CLASS_ALREADY_EXISTS is fine; anything else is fatal.
+        if (e != ERROR_CLASS_ALREADY_EXISTS)
+            fprintf(stderr, "pin overlay: RegisterClassExW failed (%lu)\n", e);
+    }
 
     HWND hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         kClass, L"vkrender PIN", WS_POPUP, 0, 0, kWidth, kHeight, nullptr, nullptr,
         wc.hInstance, nullptr);
-    if (!hwnd) return;
+    if (!hwnd) {
+        fprintf(stderr, "pin overlay: CreateWindowExW failed (%lu)\n", GetLastError());
+        g_running = false; // let a later attempt retry instead of wedging
+        return;
+    }
+    fprintf(stderr, "pin overlay: window %p created\n", (void*)hwnd);
     {
         std::lock_guard<std::mutex> hold(g_mutex);
         g_hwnd = hwnd;

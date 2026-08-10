@@ -196,7 +196,7 @@ raop_handler_pairpinstart(raop_conn_t *conn,
     }
     logger_log(conn->raop->logger, LOGGER_INFO, "*** CLIENT MUST NOW ENTER PIN = \"%s\" AS AIRPLAY PASSWORD", pin);
     *response_data = NULL;
-    response_datalen = 0;
+    *response_datalen = 0; /* vkrender: was assigning the pointer, not the value */
     return;
 }
 
@@ -245,7 +245,7 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
         if (strncmp(method, "pin", strlen (method))) {
             logger_log(conn->raop->logger, LOGGER_ERR, "error, required method is \"pin\", client requested \"%s\"", method);
             *response_data = NULL;
-            response_datalen = 0;
+            *response_datalen = 0; /* vkrender: was assigning the pointer */
 	    free (method);
 	    plist_free (req_root_node);
             return;
@@ -355,13 +355,18 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
 	return;
     }
  authentication_failed:;
-    http_response_destroy(response);
-    response = http_response_init("RTSP/1.0", 470, "Client Authentication Failure");
-    const char *cseq = http_request_get_header(request, "CSeq");
-    http_response_add_header(response, "CSeq", cseq);
-    http_response_add_header(response, "Server", "AirTunes/"GLOBAL_VERSION);
+    /* vkrender fix: this used to destroy `response` and re-init a local copy.
+       `response` is passed BY VALUE while conn_request holds the only real
+       reference, so the destroy freed the caller's object, the replacement was
+       thrown away on return, and conn_request then ran http_response_finish()
+       on freed memory - a wrong PIN killed the entire receiver and took the
+       mDNS advertisement down with it. Flag it instead; conn_request builds
+       the 470 because it owns the response.
+       `response_datalen = 0` also assigned the POINTER rather than the value,
+       so the caller's length was never actually cleared. */
+    conn->auth_failed = true;
     *response_data = NULL;
-    response_datalen = 0;
+    *response_datalen = 0;
     return;
 }
 

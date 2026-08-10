@@ -89,6 +89,14 @@ struct raop_conn_s {
     int remotelen;
 
     bool have_active_remote;
+
+    /* vkrender: set by a handler that wants a 470 Client Authentication
+       Failure. The handler CANNOT build that response itself - it receives the
+       response BY VALUE, so destroying it there left conn_request calling
+       http_response_finish() on freed memory, which crashed the whole receiver
+       on a single mistyped PIN. conn_request owns the response, so it rebuilds
+       it after the handler returns. */
+    bool auth_failed;
 };
 typedef struct raop_conn_s raop_conn_t;
 
@@ -267,6 +275,22 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
     if (handler != NULL) {
         handler(conn, request, *response, &response_data, &response_datalen);
     }
+
+    /* vkrender: a handler asked for 470 Client Authentication Failure (wrong
+       PIN). Only we can do that safely - the handler holds the response by
+       value, so it cannot swap ours out. Rebuilding here keeps the response
+       object valid for http_response_finish() below; the old code destroyed it
+       inside the handler and the receiver died on every mistyped PIN. */
+    if (conn->auth_failed) {
+        conn->auth_failed = false;
+        http_response_destroy(*response);
+        *response = http_response_init("RTSP/1.0", 470, "Client Authentication Failure");
+        http_response_add_header(*response, "CSeq", cseq);
+        http_response_add_header(*response, "Server", "AirTunes/"GLOBAL_VERSION);
+        response_data = NULL;
+        response_datalen = 0;
+    }
+
     http_response_finish(*response, response_data, response_datalen);
 
     int len;

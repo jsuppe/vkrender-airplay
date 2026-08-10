@@ -293,12 +293,22 @@ int main(int argc, char** argv) {
     raop_set_plist(g_raop, "maxFPS", 30);
     raop_set_plist(g_raop, "overscanned", 0);
     raop_set_plist(g_raop, "max_ntp_timeouts", 5);
-    // A fixed VKR_PIN pins the code (the core mints a random one per pairing
-    // in auto mode); values <= 9999 are used verbatim by the pair-pin flow.
+    // A fixed VKR_PIN pins the code; auto lets the core mint one per pairing.
+    //
+    // The core's convention is the OPPOSITE of what this comment used to claim.
+    // raop_handler_pairpinstart does:
+    //     if (raop->pin > 9999) pin_4 = raop->pin % 10000;  // use ours
+    //     else                  pin_4 = random_pin();       // mint a new one
+    // so a bare 1234 is <= 9999 and gets silently REPLACED by a random code -
+    // VKR_PIN=1234 behaved exactly like auto, and the code the user typed was
+    // always refused. Offset past the sentinel so the low four digits are ours.
     if (usePin) {
         std::string fixed = vkr::pinForConnection();
-        if (!fixed.empty() && getenv("VKR_PIN") && strcmp(getenv("VKR_PIN"), "auto") != 0)
-            raop_set_plist(g_raop, "pin", atoi(fixed.c_str()));
+        if (!fixed.empty() && getenv("VKR_PIN") && strcmp(getenv("VKR_PIN"), "auto") != 0) {
+            int code = atoi(fixed.c_str()) % 10000;
+            raop_set_plist(g_raop, "pin", 10000 + code);
+            printf("airplay: fixed PIN %04d\n", code);
+        }
     }
 
     unsigned short port = 0;
