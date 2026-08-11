@@ -35,12 +35,14 @@ target_link_directories(GStreamer::win INTERFACE "${GST_ROOT}/lib")
 target_link_libraries(GStreamer::win INTERFACE
     gstreamer-1.0.lib gstapp-1.0.lib gstvideo-1.0.lib gobject-2.0.lib glib-2.0.lib)
 
-# ---- vkrender producer SDK --------------------------------------------------
-# The ONLY coupling to vkrender: vkrender_client.h + import lib + DLL.
-# Canonical source: the client-sdk release asset on the vkrender repository;
-# a snapshot is vendored under sdk/ so this repo builds standalone.
-set(VKRENDER_SDK_DIR "${CMAKE_SOURCE_DIR}/sdk" CACHE PATH
-    "Directory containing vkrender_client.h/.lib/.dll")
+# ---- framelink ---------------------------------------------------------------
+# This repo no longer depends on vkrender at all. It is a framelink producer
+# (github: framelink, MIT), which is a published library rather than another
+# application's client DLL - so this receiver can feed anything that creates
+# framelink input slots, not only this one renderer.
+# A snapshot is vendored under sdk/ so the repo builds standalone.
+set(FRAMELINK_SDK_DIR "${CMAKE_SOURCE_DIR}/sdk" CACHE PATH
+    "Directory containing framelink.h/.lib/.dll")
 
 # ---- vendored libplist (LGPL-2.1) ------------------------------------------
 set(PLIST ${CMAKE_SOURCE_DIR}/third_party/libplist)
@@ -85,12 +87,12 @@ target_compile_options(raop_static PRIVATE /w) # third-party C stays quiet
 # OpenSSL FILE* BIOs cross the DLL boundary -> applink.c must live in the exe.
 add_executable(vkr_airplay src/airplay_win.cpp src/pin_overlay.cpp
     "${GST_ROOT}/include/openssl/applink.c")
-target_include_directories(vkr_airplay PRIVATE ${UX} "${VKRENDER_SDK_DIR}"
+target_include_directories(vkr_airplay PRIVATE ${UX} "${FRAMELINK_SDK_DIR}"
     "${GST_ROOT}/include")
 target_link_libraries(vkr_airplay PRIVATE
     raop_static GStreamer::win d3d11 dxgi
-    "${VKRENDER_SDK_DIR}/vkrender_client.lib")
+    "${FRAMELINK_SDK_DIR}/framelink.lib")
 target_compile_options(vkr_airplay PRIVATE /EHsc)
 add_custom_command(TARGET vkr_airplay POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${VKRENDER_SDK_DIR}/vkrender_client.dll" $<TARGET_FILE_DIR:vkr_airplay>)
+        "${FRAMELINK_SDK_DIR}/framelink.dll" $<TARGET_FILE_DIR:vkr_airplay>)

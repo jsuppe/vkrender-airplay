@@ -5,8 +5,12 @@
 // producer stream: the raop video_process callback hands over decrypted H.264
 // access units, which a small GStreamer pipeline (appsrc -> h264parse ->
 // d3d11h264dec -> convert -> BGRA appsink) decodes, and each decoded frame is
-// uploaded into a dequeued vkrender_client ring texture. Discovery uses the
+// uploaded into a buffer from a framelink input slot. Discovery uses the
 // native Win32 DnsServiceRegister (dnssd_win.c) - no Bonjour needed.
+//
+// M38: framelink, not vkrender_client. This repo now depends on a published
+// library (github: framelink, MIT) rather than on another application's client
+// DLL, so the receiver feeds anything that creates framelink input slots.
 //
 //   vkr_airplay [pipe] [name]
 //
@@ -40,8 +44,10 @@ extern "C" {
 #include "stream.h"
 }
 
+#include "framelink.h"
+#include "framelink_d3d11.h"
+#include "framelink_slots.h"
 #include "pin_overlay.h"
-#include "vkrender_client.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -64,7 +70,7 @@ std::atomic<bool> g_pinShowing{false};
 // created it (see raop_callbacks_t::session_init), so a frame always reaches
 // the pipeline and the scene ring belonging to ITS OWN sender.
 struct Session {
-    vkrClient* client = nullptr;
+    flChannel* channel = nullptr;
     GstElement* pipeline = nullptr;
     GstElement* appsrc = nullptr;
     GstElement* appsink = nullptr;
@@ -100,7 +106,7 @@ constexpr size_t kMaxSessions = 4;
 std::mutex g_sessionsMutex;
 std::vector<Session*> g_sessions; // owned; reaped on the pump thread
 
-// ---- GStreamer decode: H.264 AUs -> BGRA frames -> vkrClient ring ----------
+// ---- GStreamer decode: H.264 AUs -> BGRA frames -> framelink slot ----------
 
 bool buildPipeline(Session* s) {
     GError* err = nullptr;
@@ -130,11 +136,13 @@ bool buildPipeline(Session* s) {
 }
 
 // Tear one presenter down. Main pump thread only - GStreamer state changes and
-// vkrDisconnect must not race the pull loop.
+// the framelink detach must not race the pull loop.
 void destroySession(Session* s) {
-    if (s->client) {
-        vkrDisconnect(s->client);
-        s->client = nullptr;
+    if (s->channel) {
+        // Releases the slot for the next presenter; the channel is the
+        // renderer's and outlives us.
+        flClose(s->channel);
+        s->channel = nullptr;
     }
     if (s->pipeline) {
         gst_element_set_state(s->pipeline, GST_STATE_NULL);
@@ -166,29 +174,35 @@ void pumpSession(Session* s) {
         GstBuffer* buffer = gst_sample_get_buffer(sample);
         GstMapInfo map;
         if (w > 0 && h > 0 && buffer && gst_buffer_map(buffer, &map, GST_MAP_READ)) {
-            // Lazy connect at the mirror's true resolution (a fixed-size ring
-            // cropped larger mirrors to its top-left corner).
-            if (!s->client) {
-                s->client = vkrConnect(g_pipe, nullptr, w, h);
-                if (s->client)
-                    printf("airplay: '%s' producing %dx%d\n", s->label.c_str(), w, h);
+            // Take a slot at the mirror's true resolution, on the first frame -
+            // which is the earliest AirPlay tells us what that resolution is,
+            // and an iPad's 752x1080 is nothing like a MacBook's 1920x1080.
+            // No wait here: we are on the pump thread with a frame in hand.
+            if (!s->channel) {
+                uint32_t slot = 0;
+                const std::string prefix = std::string(g_pipe) + ".in";
+                flOpenProducerSlot(prefix.c_str(), 12, (uint32_t)w, (uint32_t)h,
+                                   FL_FORMAT_BGRA8, 0, &s->channel, &slot);
+                if (s->channel)
+                    printf("airplay: '%s' producing %dx%d on '%s.in.%u'\n", s->label.c_str(),
+                           w, h, g_pipe, slot);
             }
-            vkrBuffer buf;
-            if (s->client && vkrDequeueBuffer(s->client, &buf, 5) == 0) {
-                ComPtr<ID3D11Device> dev = vkrGetDevice(s->client);
+            flBuffer buf{};
+            if (s->channel && flAcquireBuffer(s->channel, &buf, 5) == FL_OK) {
+                ID3D11Device* dev = flChannelD3D11Device(s->channel);
                 ComPtr<ID3D11DeviceContext> ctx;
                 dev->GetImmediateContext(&ctx);
+                ID3D11Texture2D* tex = flImageD3D11(buf.image);
                 D3D11_TEXTURE2D_DESC td{};
-                buf.texture->GetDesc(&td);
-                // Upload the top-left min(src,dst) region (ring is 1280x720;
-                // mirrors are commonly larger - a full letterbox/scale pass is
-                // a future refinement).
+                tex->GetDesc(&td);
+                // Upload the top-left min(src,dst) region. The ring is now
+                // sized by flRequestGeometry, so this normally copies the whole
+                // frame; it still clamps in case the consumer declined.
                 UINT cw = (UINT)w < td.Width ? (UINT)w : td.Width;
                 UINT chh = (UINT)h < td.Height ? (UINT)h : td.Height;
                 D3D11_BOX box{0, 0, 0, cw, chh, 1};
-                ctx->UpdateSubresource(buf.texture, 0, &box, map.data, (UINT)w * 4,
-                                       (UINT)w * 4 * chh);
-                vkrQueueBuffer(s->client, &buf, -1);
+                ctx->UpdateSubresource(tex, 0, &box, map.data, (UINT)w * 4, (UINT)w * 4 * chh);
+                flSubmit(s->channel, &buf, -1);
                 ++s->frames;
             }
             gst_buffer_unmap(buffer, &map);
@@ -199,7 +213,7 @@ void pumpSession(Session* s) {
 
 // Service every presenter, and reap the ones whose sender has gone. Teardown
 // happens HERE rather than in the raop callback so GStreamer teardown and
-// vkrDisconnect never race this loop.
+// the framelink detach never race this loop.
 void pumpDecodedFrames() {
     std::vector<Session*> dead;
     {
@@ -381,14 +395,22 @@ int main(int argc, char** argv) {
 
     gst_init(&argc, &argv);
 
-    // Fail fast if the service is down; the real connection is made lazily at
-    // the mirror's true resolution, and released when the sender stops.
-    vkrClient* probe = vkrConnect(g_pipe, nullptr, 64, 64);
-    if (!probe) {
-        fprintf(stderr, "airplay: cannot reach vkrenderer service on pipe '%s'\n", g_pipe);
-        return 1;
+    // Fail fast if the renderer is down; slots are taken lazily, per sender, at
+    // the mirror's true resolution, and released when that sender stops.
+    //
+    // FL_BUSY is a PASS here: it means slot 0 exists and someone is using it,
+    // which proves the renderer is running just as well as a free slot does.
+    {
+        flChannel* probe = nullptr;
+        const std::string slot0 = std::string(g_pipe) + ".in.0";
+        const flResult r = flOpenProducer(slot0.c_str(), &probe);
+        if (r == FL_OK) flClose(probe);
+        if (r != FL_OK && r != FL_BUSY) {
+            fprintf(stderr, "airplay: no framelink input slots on '%s' - %s\n", g_pipe,
+                    flResultString(r));
+            return 1;
+        }
     }
-    vkrDisconnect(probe);
     // No pipeline here any more - each sender builds its own in cbSessionInit.
 
     int error = 0;
