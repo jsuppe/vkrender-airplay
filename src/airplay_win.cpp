@@ -106,6 +106,9 @@ struct Session {
     std::atomic<bool> producing{false};
     std::atomic<uint64_t> received{0}; // H.264 AUs handed over by the core
     uint64_t frames = 0;               // frames actually delivered to the scene
+    uint64_t decoded = 0;              // frames pulled from the decoder
+    uint64_t ringFull = 0;             // decoded frames dropped: no free ring image
+    uint64_t lastRingFull = 0;
     uint64_t lastFrames = 0, lastReceived = 0; // for per-interval rates
     // Arrival pacing. A 5s average cannot tell steady 36 fps from bursts
     // separated by stalls, and the reported stutter is ~1 Hz - invisible in
@@ -327,7 +330,10 @@ void deliverGpu(Session* s, GstSample* sample) {
     if (flQuery(s->channel, &info) != FL_OK) return;
     flBuffer buf{};
     // Ring full means the consumer is behind: latest-wins, drop this one.
-    if (flAcquireBuffer(s->channel, &buf, 5) != FL_OK) return;
+    if (flAcquireBuffer(s->channel, &buf, 5) != FL_OK) {
+        ++s->ringFull;
+        return;
+    }
 
     // (Re)build the converter when the stream or the ring changed shape.
     if (!s->converter || info.generation != s->converterGeneration ||
@@ -400,7 +406,9 @@ void deliverCpu(Session* s, GstSample* sample) {
     if (s->channel || openSlot(s, (uint32_t)w, (uint32_t)h)) {
         ensureGeometry(s, w, h);
         flBuffer buf{};
-        if (flAcquireBuffer(s->channel, &buf, 5) == FL_OK) {
+        if (flAcquireBuffer(s->channel, &buf, 5) != FL_OK) {
+            ++s->ringFull;
+        } else {
             ID3D11Device* dev = flChannelD3D11Device(s->channel);
             ComPtr<ID3D11DeviceContext> ctx;
             dev->GetImmediateContext(&ctx);
@@ -447,6 +455,7 @@ void pumpSession(Session* s) {
         GstSample* sample =
             gst_app_sink_try_pull_sample(GST_APP_SINK(s->appsink), 0); // non-blocking
         if (!sample) return;
+        ++s->decoded;
         if (s->gpu) deliverGpu(s, sample);
         else deliverCpu(s, sample);
         gst_sample_unref(sample);
@@ -501,13 +510,16 @@ void reportRates() {
         if (dRx == 0 && dTx == 0) continue;
         const uint64_t maxGap = s->maxGapUs.exchange(0);
         const uint64_t stalls = s->longGaps.exchange(0);
+        const uint64_t dFull = s->ringFull - s->lastRingFull;
+        s->lastRingFull = s->ringFull;
         // Only call it dropping if it is worth noticing: a +/-1 difference is
         // just a frame landing either side of the interval boundary.
         const bool dropping = dTx + 5 < dRx;
         printf("airplay: '%s' 5s: %llu rx, %llu to scene (%.1f fps), worst gap %.0f ms, "
-               "%llu stalls >40ms%s\n",
+               "%llu stalls >40ms, %llu ring-full%s\n",
                s->label.c_str(), (unsigned long long)dRx, (unsigned long long)dTx, dRx / 5.0,
-               maxGap / 1000.0, (unsigned long long)stalls, dropping ? "  <-- DROPPING" : "");
+               maxGap / 1000.0, (unsigned long long)stalls, (unsigned long long)dFull,
+               dropping ? "  <-- DROPPING" : "");
     }
 }
 
@@ -669,6 +681,8 @@ int runSelfTest(int frames) {
         Sleep(4);
     }
     const uint64_t delivered = s->frames;
+    const uint64_t decoded = s->decoded;
+    const uint64_t ringFull = s->ringFull;
     const bool gpu = s->gpu;
     const bool failed = s->failed.load();
     flChannelInfo info{};
@@ -680,9 +694,10 @@ int runSelfTest(int frames) {
     pumpDecodedFrames(); // reaps it: closes the slot, tears the decoder down
     const bool ok = !failed && pushed == frames && delivered + 2 >= (uint64_t)pushed &&
                     (gpu || g_decodeMode == DecodeMode::Cpu);
-    printf("selftest: %s - %d AUs pushed, %llu frames delivered to the ring "
-           "(%ux%u BGRA, generation %llu) via the %s path\n",
-           ok ? "PASS" : "FAIL", pushed, (unsigned long long)delivered, info.width, info.height,
+    printf("selftest: %s - %d AUs pushed, %llu decoded, %llu ring-full drops, %llu frames "
+           "delivered to the ring (%ux%u BGRA, generation %llu) via the %s path\n",
+           ok ? "PASS" : "FAIL", pushed, (unsigned long long)decoded, (unsigned long long)ringFull,
+           (unsigned long long)delivered, info.width, info.height,
            (unsigned long long)info.generation, gpu ? "GPU zero-copy" : "CPU upload");
     return ok ? 0 : 1;
 }
