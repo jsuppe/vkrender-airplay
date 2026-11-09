@@ -11,27 +11,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Same GStreamer install as framelink's own CI: a cached pair of MSIs,
+      # downloads that fail loudly, and 3010 (reboot pending) accepted as success.
       - name: Cache GStreamer MSIs
         id: gst-cache
         uses: actions/cache@v4
         with:
           path: gst-msi
-          key: gstreamer-msvc-1.26.11
+          key: gstreamer-msvc-1.26.11-v2
 
       - name: Download GStreamer MSIs
         if: steps.gst-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory gst-msi | Out-Null
-          curl.exe -sL -o gst-msi/runtime.msi https://gstreamer.freedesktop.org/data/pkg/windows/1.26.11/msvc/gstreamer-1.0-msvc-x86_64-1.26.11.msi
-          curl.exe -sL -o gst-msi/devel.msi https://gstreamer.freedesktop.org/data/pkg/windows/1.26.11/msvc/gstreamer-1.0-devel-msvc-x86_64-1.26.11.msi
+          New-Item -ItemType Directory gst-msi -Force | Out-Null
+          curl.exe -fLsS -o gst-msi/runtime.msi https://gstreamer.freedesktop.org/data/pkg/windows/1.26.11/msvc/gstreamer-1.0-msvc-x86_64-1.26.11.msi
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          curl.exe -fLsS -o gst-msi/devel.msi https://gstreamer.freedesktop.org/data/pkg/windows/1.26.11/msvc/gstreamer-1.0-devel-msvc-x86_64-1.26.11.msi
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Install GStreamer
         shell: pwsh
         run: |
-          $p1 = Start-Process msiexec -ArgumentList '/i',"$PWD\gst-msi\runtime.msi",'/qn','/norestart','ADDLOCAL=ALL' -Wait -PassThru
-          $p2 = Start-Process msiexec -ArgumentList '/i',"$PWD\gst-msi\devel.msi",'/qn','/norestart','ADDLOCAL=ALL' -Wait -PassThru
-          if ($p1.ExitCode -ne 0 -or $p2.ExitCode -ne 0) { exit 1 }
+          foreach ($name in @('runtime', 'devel')) {
+            $p = Start-Process msiexec -ArgumentList '/i',"$PWD\gst-msi\$name.msi",'/qn','/norestart','ADDLOCAL=ALL' -Wait -PassThru
+            if ($p.ExitCode -notin @(0,3010)) { throw "GStreamer $name installation failed: $($p.ExitCode)" }
+          }
+          $root = @('C:\gstreamer\1.0\msvc_x86_64','C:\Program Files\gstreamer\1.0\msvc_x86_64') | Where-Object { Test-Path "$_\lib\gstreamer-1.0.lib" } | Select-Object -First 1
+          if (!$root) { throw 'GStreamer development install not found' }
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$root" >> $env:GITHUB_ENV
+          "$root\bin" >> $env:GITHUB_PATH
 
       # framelink is fetched and built from source at the revision pinned in
       # CMakeLists.txt (FRAMELINK_GIT_TAG); nothing else is needed.
