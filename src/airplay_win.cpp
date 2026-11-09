@@ -244,11 +244,16 @@ bool buildGpuPipeline(Session* s) {
                 s->label.c_str());
         return false;
     }
+    // compliance=flexible: output each picture as soon as it is decoded instead
+    // of holding the spec's worst-case reorder depth in the DPB. A mirror has no
+    // B-frames, and the stock behaviour kept 5 frames (~170 ms at 30 fps) back
+    // until the stream ended - measured on caspar with the self-test.
     // max-buffers=1 drop=true: a mirror is latest-wins; never queue behind us.
     const char* desc =
         "appsrc name=src is-live=true format=time do-timestamp=true "
         "  caps=video/x-h264,stream-format=byte-stream,alignment=au ! "
-        "h264parse ! d3d11h264dec ! video/x-raw(memory:D3D11Memory),format=NV12 ! "
+        "h264parse ! d3d11h264dec compliance=flexible ! "
+        "video/x-raw(memory:D3D11Memory),format=NV12 ! "
         "appsink name=sink max-buffers=1 drop=true sync=false enable-last-sample=false";
     GstContext* ctx = gst_d3d11_context_new(s->gstDevice);
     const bool ok = launch(s, desc, ctx);
