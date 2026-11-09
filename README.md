@@ -97,7 +97,15 @@ how many reached the ring and on which path:
 ```
 vkr_airplay.exe --selftest            # 60 frames, pipe "vkrender"
 vkr_airplay.exe --selftest 120 mypipe
-selftest: PASS - 60 AUs pushed, 60 frames delivered to the ring (1280x720 BGRA, generation 2) via the GPU zero-copy path
+```
+
+Current result on an RTX 5090 with GStreamer 1.28: the GPU path reports FAIL,
+because 56 of 60 frames reached the ring and the test allows a shortfall of 2.
+The cause is not yet known. No drops were counted at the ring, and end-of-stream
+flushed only one more frame out of the decoder.
+
+```
+selftest: FAIL - 60 AUs pushed, 56 decoded live (+1 only flushed by EOS), 0 ring-full drops, 56 frames delivered to the ring (1280x720 BGRA, generation 4) via the GPU zero-copy path
 ```
 
 The log says which decode path each presenter got:

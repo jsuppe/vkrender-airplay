@@ -247,10 +247,9 @@ bool buildGpuPipeline(Session* s) {
                 s->label.c_str());
         return false;
     }
-    // compliance=flexible: output each picture as soon as it is decoded instead
-    // of holding the spec's worst-case reorder depth in the DPB. A mirror has no
-    // B-frames, and the stock behaviour kept 5 frames (~170 ms at 30 fps) back
-    // until the stream ended - measured on caspar with the self-test.
+    // compliance=flexible: intended to stop the decoder holding pictures back
+    // for reordering, since a mirror has no B-frames. Its benefit is unproven:
+    // the self-test on caspar delivered 55/60 frames with and without it.
     // max-buffers=1 drop=true: a mirror is latest-wins; never queue behind us.
     const char* desc =
         "appsrc name=src is-live=true format=time do-timestamp=true "
