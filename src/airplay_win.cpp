@@ -26,7 +26,9 @@
 #include <d3d11.h>
 #include <wrl/client.h>
 
-#define GST_USE_UNSTABLE_API
+#ifndef GST_USE_UNSTABLE_API
+#define GST_USE_UNSTABLE_API // gst/d3d11 is unstable API; CMake defines this too
+#endif
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/d3d11/gstd3d11.h>
@@ -630,21 +632,29 @@ int runSelfTest(int frames) {
     GstElement* encSink = gst_bin_get_by_name(GST_BIN(enc), "enc");
     gst_element_set_state(enc, GST_STATE_PLAYING);
     int pushed = 0;
+    ULONGLONG lastAu = GetTickCount64();
     for (;;) {
-        GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(encSink), 2 * GST_SECOND);
-        if (!sample) break; // EOS (num-buffers reached) or the encoder stalled
-        GstBuffer* b = gst_sample_get_buffer(sample);
-        GstMapInfo map;
-        if (b && gst_buffer_map(b, &map, GST_MAP_READ)) {
-            h264_decode_struct au{};
-            au.nal_count = 1;
-            au.data = map.data;
-            au.data_len = (int)map.size;
-            cbVideoProcess(s, nullptr, &au);
-            ++pushed;
-            gst_buffer_unmap(b, &map);
+        // Same cadence as main(): drain decoded frames every few ms whether or
+        // not an access unit arrived. With appsink max-buffers=1 a pump that
+        // only ran per AU would itself drop frames and blame the GPU path.
+        GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(encSink), 4 * GST_MSECOND);
+        if (sample) {
+            GstBuffer* b = gst_sample_get_buffer(sample);
+            GstMapInfo map;
+            if (b && gst_buffer_map(b, &map, GST_MAP_READ)) {
+                h264_decode_struct au{};
+                au.nal_count = 1;
+                au.data = map.data;
+                au.data_len = (int)map.size;
+                cbVideoProcess(s, nullptr, &au);
+                ++pushed;
+                gst_buffer_unmap(b, &map);
+            }
+            gst_sample_unref(sample);
+            lastAu = GetTickCount64();
+        } else if (gst_app_sink_is_eos(GST_APP_SINK(encSink)) || GetTickCount64() - lastAu > 2000) {
+            break; // num-buffers reached, or the encoder stalled
         }
-        gst_sample_unref(sample);
         pumpDecodedFrames();
     }
     // Drain: a hardware decoder holds a frame or two until the next one lands.
