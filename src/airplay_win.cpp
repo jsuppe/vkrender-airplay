@@ -675,13 +675,22 @@ int runSelfTest(int frames) {
         pumpDecodedFrames();
     }
     // Drain: a hardware decoder holds a frame or two until the next one lands.
-    const ULONGLONG deadline = GetTickCount64() + 3000;
+    ULONGLONG deadline = GetTickCount64() + 1500;
     while (s->frames + 2 < (uint64_t)pushed && GetTickCount64() < deadline) {
         pumpDecodedFrames();
         Sleep(4);
     }
     const uint64_t delivered = s->frames;
     const uint64_t decoded = s->decoded;
+    // Diagnostic: what EOS flushes out is exactly what the decoder was holding
+    // back during the live run - i.e. latency the mirror would have had.
+    if (s->appsrc) gst_app_src_end_of_stream(GST_APP_SRC(s->appsrc));
+    deadline = GetTickCount64() + 1500;
+    while (s->decoded < (uint64_t)pushed && GetTickCount64() < deadline) {
+        pumpDecodedFrames();
+        Sleep(4);
+    }
+    const uint64_t heldBack = s->decoded - decoded;
     const uint64_t ringFull = s->ringFull;
     const bool gpu = s->gpu;
     const bool failed = s->failed.load();
@@ -694,10 +703,11 @@ int runSelfTest(int frames) {
     pumpDecodedFrames(); // reaps it: closes the slot, tears the decoder down
     const bool ok = !failed && pushed == frames && delivered + 2 >= (uint64_t)pushed &&
                     (gpu || g_decodeMode == DecodeMode::Cpu);
-    printf("selftest: %s - %d AUs pushed, %llu decoded, %llu ring-full drops, %llu frames "
-           "delivered to the ring (%ux%u BGRA, generation %llu) via the %s path\n",
-           ok ? "PASS" : "FAIL", pushed, (unsigned long long)decoded, (unsigned long long)ringFull,
-           (unsigned long long)delivered, info.width, info.height,
+    printf("selftest: %s - %d AUs pushed, %llu decoded live (+%llu only flushed by EOS), "
+           "%llu ring-full drops, %llu frames delivered to the ring (%ux%u BGRA, generation %llu) "
+           "via the %s path\n",
+           ok ? "PASS" : "FAIL", pushed, (unsigned long long)decoded, (unsigned long long)heldBack,
+           (unsigned long long)ringFull, (unsigned long long)delivered, info.width, info.height,
            (unsigned long long)info.generation, gpu ? "GPU zero-copy" : "CPU upload");
     return ok ? 0 : 1;
 }
