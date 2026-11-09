@@ -14,6 +14,7 @@
 // DLL, so the receiver feeds anything that creates framelink input slots.
 //
 //   vkr_airplay [pipe] [name]
+//   vkr_airplay --selftest [frames] [pipe]   (synthetic mirror, see runSelfTest)
 //
 // Requirements: the vkrenderer service (--serve) must be running; a
 // Miracast/AirPlay-capable network (multicast reachable). Video only.
@@ -600,6 +601,77 @@ void cbLog(void*, int level, const char* msg) {
     fprintf(level <= LOGGER_ERR ? stderr : stdout, "airplay-raop: %s\n", msg);
 }
 
+// ---- self-test: a synthetic mirror through the real frame path --------------
+//
+// `vkr_airplay --selftest [frames] [pipe]`: no AirPlay, no sender. Encodes N
+// test frames with x264 and hands the access units to cbVideoProcess exactly as
+// the RAOP core would, so the decoder, the GPU colour pass and the framelink
+// submit run unchanged against a live renderer (`vkrenderer --serve <pipe>
+// --headless -1` works for this). PASS means the frames reached the ring on the
+// zero-copy path, or on the CPU path when that one was selected.
+int runSelfTest(int frames) {
+    Session* s = (Session*)cbSessionInit(nullptr);
+    if (!s) return 1;
+    s->label = "selftest";
+    char desc[512];
+    snprintf(desc, sizeof(desc),
+             "videotestsrc is-live=true num-buffers=%d pattern=smpte ! "
+             "video/x-raw,format=NV12,width=1280,height=720,framerate=30/1 ! "
+             "x264enc tune=zerolatency bframes=0 key-int-max=30 speed-preset=ultrafast ! "
+             "video/x-h264,stream-format=byte-stream,alignment=au ! "
+             "appsink name=enc sync=false",
+             frames);
+    GError* err = nullptr;
+    GstElement* enc = gst_parse_launch(desc, &err);
+    if (!enc || err) {
+        fprintf(stderr, "selftest: encoder pipeline failed: %s\n", err ? err->message : "?");
+        return 1;
+    }
+    GstElement* encSink = gst_bin_get_by_name(GST_BIN(enc), "enc");
+    gst_element_set_state(enc, GST_STATE_PLAYING);
+    int pushed = 0;
+    for (;;) {
+        GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(encSink), 2 * GST_SECOND);
+        if (!sample) break; // EOS (num-buffers reached) or the encoder stalled
+        GstBuffer* b = gst_sample_get_buffer(sample);
+        GstMapInfo map;
+        if (b && gst_buffer_map(b, &map, GST_MAP_READ)) {
+            h264_decode_struct au{};
+            au.nal_count = 1;
+            au.data = map.data;
+            au.data_len = (int)map.size;
+            cbVideoProcess(s, nullptr, &au);
+            ++pushed;
+            gst_buffer_unmap(b, &map);
+        }
+        gst_sample_unref(sample);
+        pumpDecodedFrames();
+    }
+    // Drain: a hardware decoder holds a frame or two until the next one lands.
+    const ULONGLONG deadline = GetTickCount64() + 3000;
+    while (s->frames + 2 < (uint64_t)pushed && GetTickCount64() < deadline) {
+        pumpDecodedFrames();
+        Sleep(4);
+    }
+    const uint64_t delivered = s->frames;
+    const bool gpu = s->gpu;
+    const bool failed = s->failed.load();
+    flChannelInfo info{};
+    if (s->channel) flQuery(s->channel, &info);
+    gst_element_set_state(enc, GST_STATE_NULL);
+    gst_object_unref(encSink);
+    gst_object_unref(enc);
+    s->ended = true;
+    pumpDecodedFrames(); // reaps it: closes the slot, tears the decoder down
+    const bool ok = !failed && pushed == frames && delivered + 2 >= (uint64_t)pushed &&
+                    (gpu || g_decodeMode == DecodeMode::Cpu);
+    printf("selftest: %s - %d AUs pushed, %llu frames delivered to the ring "
+           "(%ux%u BGRA, generation %llu) via the %s path\n",
+           ok ? "PASS" : "FAIL", pushed, (unsigned long long)delivered, info.width, info.height,
+           (unsigned long long)info.generation, gpu ? "GPU zero-copy" : "CPU upload");
+    return ok ? 0 : 1;
+}
+
 } // namespace
 
 // Crash triage: print the faulting module+offset before dying, so a live
@@ -624,8 +696,16 @@ LONG WINAPI crashFilter(EXCEPTION_POINTERS* ep) {
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     SetUnhandledExceptionFilter(crashFilter);
-    g_pipe = argc > 1 ? argv[1] : "vkrender";
-    const char* name = argc > 2 ? argv[2] : "vkrender";
+    const bool selfTest = argc > 1 && !strcmp(argv[1], "--selftest");
+    int selfTestFrames = 60;
+    if (selfTest) {
+        if (argc > 2) selfTestFrames = atoi(argv[2]);
+        g_pipe = argc > 3 ? argv[3] : "vkrender";
+        if (selfTestFrames <= 0) selfTestFrames = 60;
+    } else {
+        g_pipe = argc > 1 ? argv[1] : "vkrender";
+    }
+    const char* name = !selfTest && argc > 2 ? argv[2] : "vkrender";
 
     gst_init(&argc, &argv);
 
@@ -663,6 +743,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    if (selfTest) return runSelfTest(selfTestFrames);
     // No pipeline here any more - each sender builds its own in cbSessionInit.
 
     int error = 0;

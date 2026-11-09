@@ -88,6 +88,18 @@ with a different `FL_VERSION` at handshake.
    `framelink.dll` is copied next to the exe by the build)
 3. Pick **vkrender** in Screen Mirroring on the Apple device.
 
+To check the frame path on a machine without reaching for an Apple device,
+run the built-in self-test against a running renderer (headless is fine:
+`vkrenderer --serve vkrender --headless -1`). It encodes 60 synthetic frames,
+feeds the access units through the exact code the RAOP core uses, and reports
+how many reached the ring and on which path:
+
+```
+vkr_airplay.exe --selftest            # 60 frames, pipe "vkrender"
+vkr_airplay.exe --selftest 120 mypipe
+selftest: PASS - 60 AUs pushed, 60 frames delivered to the ring (1280x720 BGRA, generation 2) via the GPU zero-copy path
+```
+
 The log says which decode path each presenter got:
 
 ```
