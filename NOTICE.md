@@ -10,7 +10,7 @@ core. Individual components:
 | llhttp, playfair | inside `third_party/uxplay/lib` | MIT / as upstream | bundled by UxPlay |
 | Win32 pthread/unistd shim | `third_party/win_compat` | GPL-3.0 (this project) | written for the vkrender MSVC port |
 | Receiver (`src/`) | `src/` | GPL-3.0 (this project) | vkrender project |
-| vkrender producer SDK | `sdk/` | vkrender project terms (permissive); **not** part of the GPL work | [jsuppe/vkrender](https://github.com/jsuppe/vkrender) |
+| framelink | fetched at build time (`FRAMELINK_GIT_TAG` in `CMakeLists.txt`) | MIT; **not** part of the GPL work | [jsuppe/framelink](https://github.com/jsuppe/framelink) |
 
 Windows-specific patches carried in the vendored trees (all guarded with
 `_MSC_VER`/`WIN32`): MSVC-safe replacements for GNU statement-expression

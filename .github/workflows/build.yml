@@ -33,8 +33,8 @@ jobs:
           $p2 = Start-Process msiexec -ArgumentList '/i',"$PWD\gst-msi\devel.msi",'/qn','/norestart','ADDLOCAL=ALL' -Wait -PassThru
           if ($p1.ExitCode -ne 0 -or $p2.ExitCode -ne 0) { exit 1 }
 
-      # Builds against the vendored SDK snapshot in sdk/ - no access to the
-      # (private) vkrender repo required.
+      # framelink is fetched and built from source at the revision pinned in
+      # CMakeLists.txt (FRAMELINK_GIT_TAG); nothing else is needed.
       - name: Configure
         run: cmake -S . -B build -A x64
 
@@ -46,4 +46,4 @@ jobs:
           name: vkr_airplay-win64
           path: |
             build/Release/vkr_airplay.exe
-            build/Release/vkrender_client.dll
+            build/Release/framelink.dll

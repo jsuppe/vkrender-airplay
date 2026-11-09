@@ -1,12 +1,13 @@
 // M19: AirPlay receiver -> vkrender producer (Windows native).
 //
 // Ports the same vendored UxPlay RAOP + mirroring core as the Android APK
-// (third_party/uxplay/lib) to MSVC, and turns the mirror into a vkrender
+// (third_party/uxplay/lib) to MSVC, and turns the mirror into a framelink
 // producer stream: the raop video_process callback hands over decrypted H.264
-// access units, which a small GStreamer pipeline (appsrc -> h264parse ->
-// d3d11h264dec -> convert -> BGRA appsink) decodes, and each decoded frame is
-// uploaded into a buffer from a framelink input slot. Discovery uses the
-// native Win32 DnsServiceRegister (dnssd_win.c) - no Bonjour needed.
+// access units, a small GStreamer pipeline decodes them on the GPU
+// (d3d11h264dec, on the ring's own D3D11 device), and a GPU colour pass
+// renders each frame straight into a texture of a framelink input slot. No
+// pixel touches the CPU on the way to the renderer. Discovery uses the native
+// Win32 DnsServiceRegister (dnssd_win.c) - no Bonjour needed.
 //
 // M38: framelink, not vkrender_client. This repo now depends on a published
 // library (github: framelink, MIT) rather than on another application's client
@@ -27,7 +28,9 @@
 #define GST_USE_UNSTABLE_API
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
+#include <gst/d3d11/gstd3d11.h>
 #include <gst/gst.h>
+#include <gst/video/video.h>
 
 #include <atomic>
 #include <cstdio>
@@ -74,6 +77,19 @@ struct Session {
     GstElement* pipeline = nullptr;
     GstElement* appsrc = nullptr;
     GstElement* appsink = nullptr;
+    GstBus* bus = nullptr;
+    // GPU path (see buildGpuPipeline): the ring's D3D11 device wrapped for
+    // GStreamer, and the NV12 -> BGRA converter that draws into ring textures.
+    GstD3D11Device* gstDevice = nullptr;
+    GstD3D11Converter* converter = nullptr;
+    GstVideoInfo converterIn{};        // input caps the converter was built for
+    uint64_t converterGeneration = 0;  // ring generation it targets
+    bool gpu = false;                  // false: CPU decode + upload fallback
+    bool geometryRequested = false;    // flRequestGeometry done for this mirror
+    // Decode error: the tile is released and further AUs are ignored, but the
+    // Session stays alive - the raop core still holds it as `cls`.
+    std::atomic<bool> failed{false};
+    std::atomic<bool> warned{false};   // one-shot diagnostics on the frame path
     std::atomic<bool> ready{false};
     // Set on a raop thread when the sender goes away; the main pump thread
     // does the actual teardown. Closing the producer connection is what makes
@@ -106,31 +122,163 @@ constexpr size_t kMaxSessions = 4;
 std::mutex g_sessionsMutex;
 std::vector<Session*> g_sessions; // owned; reaped on the pump thread
 
-// ---- GStreamer decode: H.264 AUs -> BGRA frames -> framelink slot ----------
+// ---- GStreamer decode: H.264 AUs -> framelink slot -------------------------
+//
+// Two decode paths, chosen once at startup (VKR_AIRPLAY_DECODE=gpu|cpu; the
+// default is gpu whenever d3d11h264dec is installed):
+//
+//   gpu  appsrc -> h264parse -> d3d11h264dec -> appsink (D3D11Memory, NV12)
+//        The decoder is created on the RING'S D3D11 device (handed over as a
+//        GstContext before the pipeline starts), so its output textures and
+//        the framelink textures live on one device. A GstD3D11Converter then
+//        renders NV12 -> BGRA directly into the acquired ring texture, and
+//        flSubmit's ready-fence signal is queued behind that draw on the same
+//        immediate context. Zero-copy: DXVA output -> one GPU colour pass ->
+//        the exact allocation the renderer's Vulkan side samples. The colour
+//        pass is not an extra hop - the renderer takes BGRA slots, so somebody
+//        has to do NV12 -> BGRA, and doing it here keeps the renderer's input
+//        on its GPU-import path rather than its CPU-conversion fallback.
+//
+//   cpu  appsrc -> h264parse -> avdec_h264 -> videoconvert -> appsink (BGRA)
+//        One UpdateSubresource per frame into the ring texture. Kept for
+//        machines without a D3D11 video device; never chosen silently.
 
-bool buildPipeline(Session* s) {
+enum class DecodeMode { Gpu, Cpu };
+DecodeMode g_decodeMode = DecodeMode::Gpu;
+
+// Take a slot. width/height 0 accepts whatever the consumer allocated; the
+// mirror's true size is requested later (ensureGeometry) once a decoded frame
+// says what it is - which is the earliest AirPlay tells us, and an iPad's
+// 752x1080 is nothing like a MacBook's 1920x1080.
+bool openSlot(Session* s, uint32_t w, uint32_t h) {
+    uint32_t slot = 0;
+    const std::string prefix = std::string(g_pipe) + ".in";
+    const flResult r = flOpenProducerSlot(prefix.c_str(), 12, w, h, FL_FORMAT_BGRA8, 0,
+                                          &s->channel, &slot);
+    if (r != FL_OK || !s->channel) {
+        fprintf(stderr, "airplay: '%s' got no input slot on '%s.in' - %s\n", s->label.c_str(),
+                g_pipe, flResultString(r));
+        s->channel = nullptr;
+        return false;
+    }
+    s->geometryRequested = w != 0 && h != 0; // flOpenProducerSlot already asked
+    printf("airplay: '%s' producing on '%s.in.%u'\n", s->label.c_str(), g_pipe, slot);
+    return true;
+}
+
+// Ask the consumer to size the ring to the mirror, once per presenter. The
+// consumer may decline; the GPU path scales into whatever it kept, the CPU
+// path clamps. flQuery afterwards is the truth either way.
+void ensureGeometry(Session* s, int w, int h) {
+    if (s->geometryRequested || w <= 0 || h <= 0) return;
+    s->geometryRequested = true;
+    const flResult r = flRequestGeometry(s->channel, (uint32_t)w, (uint32_t)h, FL_FORMAT_BGRA8);
+    flChannelInfo info{};
+    flQuery(s->channel, &info);
+    printf("airplay: '%s' mirror is %dx%d, ring is %ux%u%s\n", s->label.c_str(), w, h,
+           info.width, info.height, r == FL_OK ? "" : " (geometry request declined)");
+}
+
+void teardownPipeline(Session* s) {
+    if (s->pipeline) {
+        gst_element_set_state(s->pipeline, GST_STATE_NULL);
+        if (s->appsrc) gst_object_unref(s->appsrc);
+        if (s->appsink) gst_object_unref(s->appsink);
+        if (s->bus) gst_object_unref(s->bus);
+        gst_object_unref(s->pipeline);
+        s->pipeline = nullptr;
+        s->appsrc = s->appsink = nullptr;
+        s->bus = nullptr;
+    }
+    if (s->converter) {
+        gst_object_unref(s->converter);
+        s->converter = nullptr;
+    }
+    if (s->gstDevice) {
+        gst_object_unref(s->gstDevice);
+        s->gstDevice = nullptr;
+    }
+}
+
+bool launch(Session* s, const char* desc, GstContext* ctx) {
     GError* err = nullptr;
-    // System-memory BGRA out: the frame is UpdateSubresource'd into the ring
-    // texture on the client's own device, so no cross-device sharing is
-    // needed (one upload per frame - fine for a phone mirror).
-    // Software decode (avdec_h264): the d3d11 hardware decoder crashed during
-    // state change on this stack (E_NOINTERFACE on the video device); CPU
-    // decode of a phone mirror is comfortably fast and avoids the d3d11
-    // device juggling. The frame is uploaded to the ring texture anyway.
+    s->pipeline = gst_parse_launch(desc, &err);
+    if (!s->pipeline || err) {
+        fprintf(stderr, "airplay: pipeline build failed: %s\n", err ? err->message : "?");
+        if (err) g_error_free(err);
+        if (s->pipeline) gst_object_unref(s->pipeline);
+        s->pipeline = nullptr;
+        return false;
+    }
+    // Must precede the state change: elements pick their device going to READY.
+    if (ctx) gst_element_set_context(s->pipeline, ctx);
+    s->appsrc = gst_bin_get_by_name(GST_BIN(s->pipeline), "src");
+    s->appsink = gst_bin_get_by_name(GST_BIN(s->pipeline), "sink");
+    s->bus = gst_element_get_bus(s->pipeline);
+    if (gst_element_set_state(s->pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+        fprintf(stderr, "airplay: pipeline refused to start\n");
+        teardownPipeline(s);
+        return false;
+    }
+    return true;
+}
+
+bool buildGpuPipeline(Session* s) {
+    // The slot comes first: the decoder has to be created on the ring's device.
+    if (!s->channel && !openSlot(s, 0, 0)) return false;
+    ID3D11Device* dev = flChannelD3D11Device(s->channel);
+    ComPtr<ID3D11VideoDevice> video;
+    if (!dev || FAILED(dev->QueryInterface(IID_PPV_ARGS(&video)))) {
+        // The E_NOINTERFACE that used to take d3d11h264dec down mid state
+        // change, caught up front; this presenter decodes on the CPU instead.
+        fprintf(stderr, "airplay: '%s' ring device has no D3D11 video support - CPU decode\n",
+                s->label.c_str());
+        return false;
+    }
+    s->gstDevice = gst_d3d11_device_new_wrapped(dev);
+    if (!s->gstDevice) {
+        fprintf(stderr, "airplay: '%s' cannot wrap the ring's D3D11 device - CPU decode\n",
+                s->label.c_str());
+        return false;
+    }
+    // max-buffers=1 drop=true: a mirror is latest-wins; never queue behind us.
+    const char* desc =
+        "appsrc name=src is-live=true format=time do-timestamp=true "
+        "  caps=video/x-h264,stream-format=byte-stream,alignment=au ! "
+        "h264parse ! d3d11h264dec ! video/x-raw(memory:D3D11Memory),format=NV12 ! "
+        "appsink name=sink max-buffers=1 drop=true sync=false enable-last-sample=false";
+    GstContext* ctx = gst_d3d11_context_new(s->gstDevice);
+    const bool ok = launch(s, desc, ctx);
+    gst_context_unref(ctx);
+    if (!ok) {
+        teardownPipeline(s); // drops the wrapped device too
+        return false;
+    }
+    s->gpu = true;
+    return true;
+}
+
+bool buildCpuPipeline(Session* s) {
     const char* desc =
         "appsrc name=src is-live=true format=time do-timestamp=true "
         "  caps=video/x-h264,stream-format=byte-stream,alignment=au ! "
         "h264parse ! avdec_h264 ! videoconvert ! "
         "video/x-raw,format=BGRA ! appsink name=sink max-buffers=4 drop=true sync=false";
-    s->pipeline = gst_parse_launch(desc, &err);
-    if (!s->pipeline || err) {
-        fprintf(stderr, "airplay: pipeline build failed: %s\n", err ? err->message : "?");
-        if (err) g_error_free(err);
+    if (!launch(s, desc, nullptr)) return false;
+    s->gpu = false;
+    return true;
+}
+
+bool buildPipeline(Session* s) {
+    if (g_decodeMode == DecodeMode::Gpu && buildGpuPipeline(s)) {
+        printf("airplay: '%s' decoding on the GPU (d3d11h264dec -> BGRA ring, zero-copy)\n",
+               s->label.c_str());
+    } else if (buildCpuPipeline(s)) {
+        printf("airplay: '%s' decoding on the CPU (avdec_h264, one upload per frame)\n",
+               s->label.c_str());
+    } else {
         return false;
     }
-    s->appsrc = gst_bin_get_by_name(GST_BIN(s->pipeline), "src");
-    s->appsink = gst_bin_get_by_name(GST_BIN(s->pipeline), "sink");
-    gst_element_set_state(s->pipeline, GST_STATE_PLAYING);
     s->ready = true;
     return true;
 }
@@ -138,75 +286,161 @@ bool buildPipeline(Session* s) {
 // Tear one presenter down. Main pump thread only - GStreamer state changes and
 // the framelink detach must not race the pull loop.
 void destroySession(Session* s) {
+    teardownPipeline(s); // decoder textures live on the ring's device: it goes first
     if (s->channel) {
         // Releases the slot for the next presenter; the channel is the
         // renderer's and outlives us.
         flClose(s->channel);
         s->channel = nullptr;
     }
-    if (s->pipeline) {
-        gst_element_set_state(s->pipeline, GST_STATE_NULL);
-        if (s->appsrc) gst_object_unref(s->appsrc);
-        if (s->appsink) gst_object_unref(s->appsink);
-        gst_object_unref(s->pipeline);
-        s->pipeline = nullptr;
-        s->appsrc = s->appsink = nullptr;
-    }
     printf("airplay: session '%s' released after %llu frames\n", s->label.c_str(),
            (unsigned long long)s->frames);
     delete s;
 }
 
+void warnOnce(Session* s, const char* what) {
+    if (!s->warned.exchange(true))
+        fprintf(stderr, "airplay: '%s' %s - frames are being dropped\n", s->label.c_str(), what);
+}
+
+// GPU path: decoder NV12 texture -> BGRA ring texture, one draw on the ring's
+// device, then submit. Nothing is mapped.
+void deliverGpu(Session* s, GstSample* sample) {
+    GstBuffer* src = gst_sample_get_buffer(sample);
+    GstMemory* mem = src && gst_buffer_n_memory(src) ? gst_buffer_peek_memory(src, 0) : nullptr;
+    GstVideoInfo in;
+    if (!mem || !gst_is_d3d11_memory(mem) ||
+        !gst_video_info_from_caps(&in, gst_sample_get_caps(sample))) {
+        warnOnce(s, "decoder output is not D3D11 memory");
+        return;
+    }
+    ensureGeometry(s, in.width, in.height);
+    flChannelInfo info{};
+    if (flQuery(s->channel, &info) != FL_OK) return;
+    flBuffer buf{};
+    // Ring full means the consumer is behind: latest-wins, drop this one.
+    if (flAcquireBuffer(s->channel, &buf, 5) != FL_OK) return;
+
+    // (Re)build the converter when the stream or the ring changed shape.
+    if (!s->converter || info.generation != s->converterGeneration ||
+        !gst_video_info_is_equal(&in, &s->converterIn)) {
+        if (s->converter) gst_object_unref(s->converter);
+        GstVideoInfo out;
+        gst_video_info_set_format(&out, GST_VIDEO_FORMAT_BGRA, info.width, info.height);
+        out.colorimetry.range = GST_VIDEO_COLOR_RANGE_0_255;
+        s->converter = gst_d3d11_converter_new(s->gstDevice, &in, &out, nullptr);
+        s->converterIn = in;
+        s->converterGeneration = info.generation;
+        if (!s->converter) {
+            flCancelBuffer(s->channel, &buf);
+            warnOnce(s, "cannot create the NV12 -> BGRA GPU converter");
+            return;
+        }
+    }
+
+    // Borrow the ring texture as GstD3D11Memory on the SAME GstD3D11Device, so
+    // the converter's render target is the shared allocation itself. The
+    // wrapper does not own the texture; framelink does.
+    GstMemory* dstMem = gst_d3d11_allocator_alloc_wrapped(nullptr, s->gstDevice,
+                                                          flImageD3D11(buf.image), 0, nullptr,
+                                                          nullptr);
+    guint pitch = 0;
+    if (!dstMem || !gst_d3d11_memory_get_resource_stride(GST_D3D11_MEMORY_CAST(dstMem), &pitch)) {
+        if (dstMem) gst_memory_unref(dstMem);
+        flCancelBuffer(s->channel, &buf);
+        warnOnce(s, "cannot wrap the ring texture for GStreamer");
+        return;
+    }
+    // GPU side is the truth; a CPU map (nobody does one) would have to download.
+    GST_MINI_OBJECT_FLAG_SET(dstMem, GST_D3D11_MEMORY_TRANSFER_NEED_DOWNLOAD);
+    GstBuffer* dst = gst_buffer_new();
+    gst_buffer_append_memory(dst, dstMem);
+    gsize offsets[1] = {0};
+    gint strides[1] = {(gint)pitch};
+    gst_buffer_add_video_meta_full(dst, GST_VIDEO_FRAME_FLAG_NONE, GST_VIDEO_FORMAT_BGRA,
+                                   info.width, info.height, 1, offsets, strides);
+    const gboolean drawn = gst_d3d11_converter_convert_buffer(s->converter, src, dst);
+    gst_buffer_unref(dst);
+    if (!drawn) {
+        flCancelBuffer(s->channel, &buf);
+        warnOnce(s, "GPU colour conversion failed");
+        return;
+    }
+    // Same immediate context as the draw above: framelink's ready-fence signal
+    // is ordered after it, and the decoder's reuse of its output texture is
+    // queued behind our read on that context as well - so no completion wait.
+    gst_d3d11_device_lock(s->gstDevice);
+    const flResult r = flSubmit(s->channel, &buf, -1);
+    gst_d3d11_device_unlock(s->gstDevice);
+    if (r == FL_OK) ++s->frames;
+    else warnOnce(s, flResultString(r));
+}
+
+// CPU fallback: system-memory BGRA, UpdateSubresource'd into the ring texture
+// on the ring's device (one upload per frame).
+void deliverCpu(Session* s, GstSample* sample) {
+    GstCaps* caps = gst_sample_get_caps(sample);
+    GstStructure* st = caps ? gst_caps_get_structure(caps, 0) : nullptr;
+    int w = 0, h = 0;
+    if (st) {
+        gst_structure_get_int(st, "width", &w);
+        gst_structure_get_int(st, "height", &h);
+    }
+    GstBuffer* buffer = gst_sample_get_buffer(sample);
+    GstMapInfo map;
+    if (w <= 0 || h <= 0 || !buffer || !gst_buffer_map(buffer, &map, GST_MAP_READ)) return;
+    if (s->channel || openSlot(s, (uint32_t)w, (uint32_t)h)) {
+        ensureGeometry(s, w, h);
+        flBuffer buf{};
+        if (flAcquireBuffer(s->channel, &buf, 5) == FL_OK) {
+            ID3D11Device* dev = flChannelD3D11Device(s->channel);
+            ComPtr<ID3D11DeviceContext> ctx;
+            dev->GetImmediateContext(&ctx);
+            ID3D11Texture2D* tex = flImageD3D11(buf.image);
+            D3D11_TEXTURE2D_DESC td{};
+            tex->GetDesc(&td);
+            // Upload the top-left min(src,dst) region: normally the whole
+            // frame, clamped in case the consumer declined the geometry.
+            UINT cw = (UINT)w < td.Width ? (UINT)w : td.Width;
+            UINT chh = (UINT)h < td.Height ? (UINT)h : td.Height;
+            D3D11_BOX box{0, 0, 0, cw, chh, 1};
+            ctx->UpdateSubresource(tex, 0, &box, map.data, (UINT)w * 4, (UINT)w * 4 * chh);
+            if (flSubmit(s->channel, &buf, -1) == FL_OK) ++s->frames;
+        }
+    }
+    gst_buffer_unmap(buffer, &map);
+}
+
 void pumpSession(Session* s) {
-    if (!s->appsink) return;
-    // Pull every ready BGRA frame and push it to the renderer.
+    if (!s->appsink || s->failed.load()) return;
+    // A decoder error would otherwise look like a frozen mirror. Release the
+    // tile (only this thread touches the channel) and stop feeding; the
+    // pipeline itself is torn down with the session, because raop threads may
+    // still be pushing into its appsrc.
+    if (GstMessage* m = gst_bus_pop_filtered(s->bus, GST_MESSAGE_ERROR)) {
+        GError* e = nullptr;
+        gchar* dbg = nullptr;
+        gst_message_parse_error(m, &e, &dbg);
+        fprintf(stderr, "airplay: '%s' decode error: %s%s%s\n", s->label.c_str(),
+                e ? e->message : "?", dbg ? " - " : "", dbg ? dbg : "");
+        if (e) g_error_free(e);
+        g_free(dbg);
+        gst_message_unref(m);
+        s->failed = true;
+        s->producing = false;
+        if (s->channel) {
+            flClose(s->channel);
+            s->channel = nullptr;
+        }
+        return;
+    }
+    // Pull every ready frame and push it to the renderer.
     for (;;) {
         GstSample* sample =
             gst_app_sink_try_pull_sample(GST_APP_SINK(s->appsink), 0); // non-blocking
         if (!sample) return;
-        GstCaps* caps = gst_sample_get_caps(sample);
-        GstStructure* st = caps ? gst_caps_get_structure(caps, 0) : nullptr;
-        int w = 0, h = 0;
-        if (st) {
-            gst_structure_get_int(st, "width", &w);
-            gst_structure_get_int(st, "height", &h);
-        }
-        GstBuffer* buffer = gst_sample_get_buffer(sample);
-        GstMapInfo map;
-        if (w > 0 && h > 0 && buffer && gst_buffer_map(buffer, &map, GST_MAP_READ)) {
-            // Take a slot at the mirror's true resolution, on the first frame -
-            // which is the earliest AirPlay tells us what that resolution is,
-            // and an iPad's 752x1080 is nothing like a MacBook's 1920x1080.
-            // No wait here: we are on the pump thread with a frame in hand.
-            if (!s->channel) {
-                uint32_t slot = 0;
-                const std::string prefix = std::string(g_pipe) + ".in";
-                flOpenProducerSlot(prefix.c_str(), 12, (uint32_t)w, (uint32_t)h,
-                                   FL_FORMAT_BGRA8, 0, &s->channel, &slot);
-                if (s->channel)
-                    printf("airplay: '%s' producing %dx%d on '%s.in.%u'\n", s->label.c_str(),
-                           w, h, g_pipe, slot);
-            }
-            flBuffer buf{};
-            if (s->channel && flAcquireBuffer(s->channel, &buf, 5) == FL_OK) {
-                ID3D11Device* dev = flChannelD3D11Device(s->channel);
-                ComPtr<ID3D11DeviceContext> ctx;
-                dev->GetImmediateContext(&ctx);
-                ID3D11Texture2D* tex = flImageD3D11(buf.image);
-                D3D11_TEXTURE2D_DESC td{};
-                tex->GetDesc(&td);
-                // Upload the top-left min(src,dst) region. The ring is now
-                // sized by flRequestGeometry, so this normally copies the whole
-                // frame; it still clamps in case the consumer declined.
-                UINT cw = (UINT)w < td.Width ? (UINT)w : td.Width;
-                UINT chh = (UINT)h < td.Height ? (UINT)h : td.Height;
-                D3D11_BOX box{0, 0, 0, cw, chh, 1};
-                ctx->UpdateSubresource(tex, 0, &box, map.data, (UINT)w * 4, (UINT)w * 4 * chh);
-                flSubmit(s->channel, &buf, -1);
-                ++s->frames;
-            }
-            gst_buffer_unmap(buffer, &map);
-        }
+        if (s->gpu) deliverGpu(s, sample);
+        else deliverCpu(s, sample);
         gst_sample_unref(sample);
     }
 }
@@ -292,8 +526,8 @@ void* cbSessionInit(void*) {
                 kMaxSessions);
         return nullptr;
     }
-    // No pipeline yet. Most connections never carry video, and building an
-    // avdec_h264 graph for each one wasted a decoder per handshake.
+    // No pipeline yet. Most connections never carry video, and building a
+    // decoder for each one wasted one per handshake.
     Session* s = new Session();
     s->label = "unnamed";
     g_sessions.push_back(s);
@@ -308,7 +542,7 @@ void cbSessionDestroy(void* cls) {
 
 void cbVideoProcess(void* cls, raop_ntp_t*, h264_decode_struct* data) {
     Session* s = (Session*)cls;
-    if (!s || s->ended.load() || data->data_len <= 0) return;
+    if (!s || s->ended.load() || s->failed.load() || data->data_len <= 0) return;
     // First frame on this connection: THIS is the one carrying the mirror, so
     // build its decoder now and mark it a presenter.
     if (!s->ready.load()) {
@@ -394,6 +628,24 @@ int main(int argc, char** argv) {
     const char* name = argc > 2 ? argv[2] : "vkrender";
 
     gst_init(&argc, &argv);
+
+    // Decode path: GPU (zero-copy) unless overridden or the decoder is absent.
+    if (const char* mode = getenv("VKR_AIRPLAY_DECODE")) {
+        if (!_stricmp(mode, "cpu")) g_decodeMode = DecodeMode::Cpu;
+        else if (_stricmp(mode, "gpu") != 0)
+            fprintf(stderr, "airplay: VKR_AIRPLAY_DECODE=%s ignored (gpu|cpu)\n", mode);
+    }
+    if (g_decodeMode == DecodeMode::Gpu) {
+        if (GstElementFactory* f = gst_element_factory_find("d3d11h264dec")) {
+            gst_object_unref(f);
+        } else {
+            fprintf(stderr, "airplay: d3d11h264dec not installed - CPU decode, one upload per frame\n");
+            g_decodeMode = DecodeMode::Cpu;
+        }
+    }
+    printf("airplay: decode path: %s\n",
+           g_decodeMode == DecodeMode::Gpu ? "GPU (d3d11h264dec -> BGRA ring, zero-copy)"
+                                           : "CPU (avdec_h264 + upload)");
 
     // Fail fast if the renderer is down; slots are taken lazily, per sender, at
     // the mirror's true resolution, and released when that sender stops.
