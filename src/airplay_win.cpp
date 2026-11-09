@@ -14,6 +14,7 @@
 // DLL, so the receiver feeds anything that creates framelink input slots.
 //
 //   vkr_airplay [pipe] [name]
+//   vkr_airplay --selftest [frames] [pipe]   (synthetic mirror, see runSelfTest)
 //
 // Requirements: the vkrenderer service (--serve) must be running; a
 // Miracast/AirPlay-capable network (multicast reachable). Video only.
@@ -25,7 +26,9 @@
 #include <d3d11.h>
 #include <wrl/client.h>
 
-#define GST_USE_UNSTABLE_API
+#ifndef GST_USE_UNSTABLE_API
+#define GST_USE_UNSTABLE_API // gst/d3d11 is unstable API; CMake defines this too
+#endif
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/d3d11/gstd3d11.h>
@@ -103,6 +106,9 @@ struct Session {
     std::atomic<bool> producing{false};
     std::atomic<uint64_t> received{0}; // H.264 AUs handed over by the core
     uint64_t frames = 0;               // frames actually delivered to the scene
+    uint64_t decoded = 0;              // frames pulled from the decoder
+    uint64_t ringFull = 0;             // decoded frames dropped: no free ring image
+    uint64_t lastRingFull = 0;
     uint64_t lastFrames = 0, lastReceived = 0; // for per-interval rates
     // Arrival pacing. A 5s average cannot tell steady 36 fps from bursts
     // separated by stalls, and the reported stutter is ~1 Hz - invisible in
@@ -241,11 +247,15 @@ bool buildGpuPipeline(Session* s) {
                 s->label.c_str());
         return false;
     }
+    // compliance=flexible: intended to stop the decoder holding pictures back
+    // for reordering, since a mirror has no B-frames. Its benefit is unproven:
+    // the self-test on caspar delivered 55/60 frames with and without it.
     // max-buffers=1 drop=true: a mirror is latest-wins; never queue behind us.
     const char* desc =
         "appsrc name=src is-live=true format=time do-timestamp=true "
         "  caps=video/x-h264,stream-format=byte-stream,alignment=au ! "
-        "h264parse ! d3d11h264dec ! video/x-raw(memory:D3D11Memory),format=NV12 ! "
+        "h264parse ! d3d11h264dec compliance=flexible ! "
+        "video/x-raw(memory:D3D11Memory),format=NV12 ! "
         "appsink name=sink max-buffers=1 drop=true sync=false enable-last-sample=false";
     GstContext* ctx = gst_d3d11_context_new(s->gstDevice);
     const bool ok = launch(s, desc, ctx);
@@ -319,7 +329,10 @@ void deliverGpu(Session* s, GstSample* sample) {
     if (flQuery(s->channel, &info) != FL_OK) return;
     flBuffer buf{};
     // Ring full means the consumer is behind: latest-wins, drop this one.
-    if (flAcquireBuffer(s->channel, &buf, 5) != FL_OK) return;
+    if (flAcquireBuffer(s->channel, &buf, 5) != FL_OK) {
+        ++s->ringFull;
+        return;
+    }
 
     // (Re)build the converter when the stream or the ring changed shape.
     if (!s->converter || info.generation != s->converterGeneration ||
@@ -392,7 +405,9 @@ void deliverCpu(Session* s, GstSample* sample) {
     if (s->channel || openSlot(s, (uint32_t)w, (uint32_t)h)) {
         ensureGeometry(s, w, h);
         flBuffer buf{};
-        if (flAcquireBuffer(s->channel, &buf, 5) == FL_OK) {
+        if (flAcquireBuffer(s->channel, &buf, 5) != FL_OK) {
+            ++s->ringFull;
+        } else {
             ID3D11Device* dev = flChannelD3D11Device(s->channel);
             ComPtr<ID3D11DeviceContext> ctx;
             dev->GetImmediateContext(&ctx);
@@ -439,6 +454,7 @@ void pumpSession(Session* s) {
         GstSample* sample =
             gst_app_sink_try_pull_sample(GST_APP_SINK(s->appsink), 0); // non-blocking
         if (!sample) return;
+        ++s->decoded;
         if (s->gpu) deliverGpu(s, sample);
         else deliverCpu(s, sample);
         gst_sample_unref(sample);
@@ -493,13 +509,16 @@ void reportRates() {
         if (dRx == 0 && dTx == 0) continue;
         const uint64_t maxGap = s->maxGapUs.exchange(0);
         const uint64_t stalls = s->longGaps.exchange(0);
+        const uint64_t dFull = s->ringFull - s->lastRingFull;
+        s->lastRingFull = s->ringFull;
         // Only call it dropping if it is worth noticing: a +/-1 difference is
         // just a frame landing either side of the interval boundary.
         const bool dropping = dTx + 5 < dRx;
         printf("airplay: '%s' 5s: %llu rx, %llu to scene (%.1f fps), worst gap %.0f ms, "
-               "%llu stalls >40ms%s\n",
+               "%llu stalls >40ms, %llu ring-full%s\n",
                s->label.c_str(), (unsigned long long)dRx, (unsigned long long)dTx, dRx / 5.0,
-               maxGap / 1000.0, (unsigned long long)stalls, dropping ? "  <-- DROPPING" : "");
+               maxGap / 1000.0, (unsigned long long)stalls, (unsigned long long)dFull,
+               dropping ? "  <-- DROPPING" : "");
     }
 }
 
@@ -600,6 +619,98 @@ void cbLog(void*, int level, const char* msg) {
     fprintf(level <= LOGGER_ERR ? stderr : stdout, "airplay-raop: %s\n", msg);
 }
 
+// ---- self-test: a synthetic mirror through the real frame path --------------
+//
+// `vkr_airplay --selftest [frames] [pipe]`: no AirPlay, no sender. Encodes N
+// test frames with x264 and hands the access units to cbVideoProcess exactly as
+// the RAOP core would, so the decoder, the GPU colour pass and the framelink
+// submit run unchanged against a live renderer (`vkrenderer --serve <pipe>
+// --headless -1` works for this). PASS means the frames reached the ring on the
+// zero-copy path, or on the CPU path when that one was selected.
+int runSelfTest(int frames) {
+    Session* s = (Session*)cbSessionInit(nullptr);
+    if (!s) return 1;
+    s->label = "selftest";
+    char desc[512];
+    snprintf(desc, sizeof(desc),
+             "videotestsrc is-live=true num-buffers=%d pattern=smpte ! "
+             "video/x-raw,format=NV12,width=1280,height=720,framerate=30/1 ! "
+             "x264enc tune=zerolatency bframes=0 key-int-max=30 speed-preset=ultrafast ! "
+             "video/x-h264,stream-format=byte-stream,alignment=au ! "
+             "appsink name=enc sync=false",
+             frames);
+    GError* err = nullptr;
+    GstElement* enc = gst_parse_launch(desc, &err);
+    if (!enc || err) {
+        fprintf(stderr, "selftest: encoder pipeline failed: %s\n", err ? err->message : "?");
+        return 1;
+    }
+    GstElement* encSink = gst_bin_get_by_name(GST_BIN(enc), "enc");
+    gst_element_set_state(enc, GST_STATE_PLAYING);
+    int pushed = 0;
+    ULONGLONG lastAu = GetTickCount64();
+    for (;;) {
+        // Same cadence as main(): drain decoded frames every few ms whether or
+        // not an access unit arrived. With appsink max-buffers=1 a pump that
+        // only ran per AU would itself drop frames and blame the GPU path.
+        GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(encSink), 4 * GST_MSECOND);
+        if (sample) {
+            GstBuffer* b = gst_sample_get_buffer(sample);
+            GstMapInfo map;
+            if (b && gst_buffer_map(b, &map, GST_MAP_READ)) {
+                h264_decode_struct au{};
+                au.nal_count = 1;
+                au.data = map.data;
+                au.data_len = (int)map.size;
+                cbVideoProcess(s, nullptr, &au);
+                ++pushed;
+                gst_buffer_unmap(b, &map);
+            }
+            gst_sample_unref(sample);
+            lastAu = GetTickCount64();
+        } else if (gst_app_sink_is_eos(GST_APP_SINK(encSink)) || GetTickCount64() - lastAu > 2000) {
+            break; // num-buffers reached, or the encoder stalled
+        }
+        pumpDecodedFrames();
+    }
+    // Drain: a hardware decoder holds a frame or two until the next one lands.
+    ULONGLONG deadline = GetTickCount64() + 1500;
+    while (s->frames + 2 < (uint64_t)pushed && GetTickCount64() < deadline) {
+        pumpDecodedFrames();
+        Sleep(4);
+    }
+    const uint64_t delivered = s->frames;
+    const uint64_t decoded = s->decoded;
+    // Diagnostic: what EOS flushes out is exactly what the decoder was holding
+    // back during the live run - i.e. latency the mirror would have had.
+    if (s->appsrc) gst_app_src_end_of_stream(GST_APP_SRC(s->appsrc));
+    deadline = GetTickCount64() + 1500;
+    while (s->decoded < (uint64_t)pushed && GetTickCount64() < deadline) {
+        pumpDecodedFrames();
+        Sleep(4);
+    }
+    const uint64_t heldBack = s->decoded - decoded;
+    const uint64_t ringFull = s->ringFull;
+    const bool gpu = s->gpu;
+    const bool failed = s->failed.load();
+    flChannelInfo info{};
+    if (s->channel) flQuery(s->channel, &info);
+    gst_element_set_state(enc, GST_STATE_NULL);
+    gst_object_unref(encSink);
+    gst_object_unref(enc);
+    s->ended = true;
+    pumpDecodedFrames(); // reaps it: closes the slot, tears the decoder down
+    const bool ok = !failed && pushed == frames && delivered + 2 >= (uint64_t)pushed &&
+                    (gpu || g_decodeMode == DecodeMode::Cpu);
+    printf("selftest: %s - %d AUs pushed, %llu decoded live (+%llu only flushed by EOS), "
+           "%llu ring-full drops, %llu frames delivered to the ring (%ux%u BGRA, generation %llu) "
+           "via the %s path\n",
+           ok ? "PASS" : "FAIL", pushed, (unsigned long long)decoded, (unsigned long long)heldBack,
+           (unsigned long long)ringFull, (unsigned long long)delivered, info.width, info.height,
+           (unsigned long long)info.generation, gpu ? "GPU zero-copy" : "CPU upload");
+    return ok ? 0 : 1;
+}
+
 } // namespace
 
 // Crash triage: print the faulting module+offset before dying, so a live
@@ -624,8 +735,16 @@ LONG WINAPI crashFilter(EXCEPTION_POINTERS* ep) {
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     SetUnhandledExceptionFilter(crashFilter);
-    g_pipe = argc > 1 ? argv[1] : "vkrender";
-    const char* name = argc > 2 ? argv[2] : "vkrender";
+    const bool selfTest = argc > 1 && !strcmp(argv[1], "--selftest");
+    int selfTestFrames = 60;
+    if (selfTest) {
+        if (argc > 2) selfTestFrames = atoi(argv[2]);
+        g_pipe = argc > 3 ? argv[3] : "vkrender";
+        if (selfTestFrames <= 0) selfTestFrames = 60;
+    } else {
+        g_pipe = argc > 1 ? argv[1] : "vkrender";
+    }
+    const char* name = !selfTest && argc > 2 ? argv[2] : "vkrender";
 
     gst_init(&argc, &argv);
 
@@ -663,6 +782,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    if (selfTest) return runSelfTest(selfTestFrames);
     // No pipeline here any more - each sender builds its own in cbSessionInit.
 
     int error = 0;

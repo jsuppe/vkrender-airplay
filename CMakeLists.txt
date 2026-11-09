@@ -12,11 +12,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ---- GStreamer (decode) + OpenSSL (pairing crypto, bundled with GStreamer) --
 # Install the MSVC 1.0 runtime + development MSIs from
 # https://gstreamer.freedesktop.org/download/ .
-set(GST_ROOT "$ENV{GSTREAMER_1_0_ROOT_MSVC_X86_64}" CACHE PATH "GStreamer MSVC x86_64 root")
+# The devel MSI's environment variable is tried first but only trusted when it
+# actually points at an SDK (a stale or mangled value must not break the build).
+set(GST_ROOT "" CACHE PATH "GStreamer MSVC x86_64 root")
 if(NOT GST_ROOT)
-    foreach(_cand "C:/gstreamer/1.0/msvc_x86_64"
+    foreach(_cand "$ENV{GSTREAMER_1_0_ROOT_MSVC_X86_64}"
+                  "C:/gstreamer/1.0/msvc_x86_64"
                   "C:/Program Files/gstreamer/1.0/msvc_x86_64")
-        if(NOT GST_ROOT AND EXISTS "${_cand}/lib/gstreamer-1.0.lib")
+        if(NOT GST_ROOT AND NOT "${_cand}" STREQUAL "" AND EXISTS "${_cand}/lib/gstreamer-1.0.lib")
             set(GST_ROOT "${_cand}")
         endif()
     endforeach()
