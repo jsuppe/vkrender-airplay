@@ -63,15 +63,20 @@ modalities look identical on screen.
 
 ## Build
 
-Prereqs: Visual Studio (MSVC), CMake ≥ 3.20, Git, and the GStreamer **MSVC
+Prereqs: Visual Studio (MSVC), CMake ≥ 3.23, Ninja, Git, and the GStreamer **MSVC
 x86_64** runtime + development MSIs, 1.22 or newer (1.26.x is what CI uses).
 The development package provides OpenSSL and the `gstd3d11-1.0` library the
 GPU path needs.
 
+From a Visual Studio x64 developer prompt (so Ninja finds MSVC):
+
 ```bash
-cmake -S . -B build -A x64
-cmake --build build --config Release
+cmake --preset ci
+cmake --build --preset ci
 ```
+
+The `ci` preset (Ninja, Release) is the same one framelink and vkrender use;
+binaries land in `build/Release/`.
 
 framelink is fetched and built from source during configure, at the revision
 pinned by `FRAMELINK_GIT_TAG` in `CMakeLists.txt` (library only - no tests,
@@ -99,10 +104,21 @@ vkr_airplay.exe --selftest            # 60 frames, pipe "vkrender"
 vkr_airplay.exe --selftest 120 mypipe
 ```
 
-Current result on an RTX 5090 with GStreamer 1.28: the GPU path reports FAIL,
-because 56 of 60 frames reached the ring and the test allows a shortfall of 2.
-The cause is not yet known. No drops were counted at the ring, and end-of-stream
-flushed only one more frame out of the decoder.
+Current result on an RTX 5090 with GStreamer 1.28 (2026-11-17, framelink pin
+`c6d7db7`): the **CPU path passes** (59 of 60 live). The **GPU path reports
+FAIL**: 54–56 of 60 frames reach the ring, and the test allows a shortfall of
+2. The previous framelink pin `3ba77d4` gives the same 55–56, so this is not a
+framelink change. No drops are counted at the ring, and end-of-stream flushes
+only one more frame out of the decoder, so the missing frames never leave the
+decode pipeline.
+
+Likely cause: the GPU pipeline ends in `appsink max-buffers=1 drop=true`
+(latest frame wins, by design for a live mirror). When the hardware decoder
+emits two frames between pulls, the older one is replaced before it is
+counted. An earlier diagnostic build with a deeper sink delivered 58–59 and
+passed. The CPU pipeline keeps 4 buffers. Whether to deepen the GPU sink
+(adding up to a few frames of latency) or relax the test for the GPU path is
+an open decision.
 
 ```
 selftest: FAIL - 60 AUs pushed, 56 decoded live (+1 only flushed by EOS), 0 ring-full drops, 56 frames delivered to the ring (1280x720 BGRA, generation 4) via the GPU zero-copy path
