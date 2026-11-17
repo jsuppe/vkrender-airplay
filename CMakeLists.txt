@@ -56,8 +56,8 @@ target_compile_definitions(GStreamer::win INTERFACE GST_USE_UNSTABLE_API)
 # standalone and producer and renderer agree on FL_VERSION (the wire format is
 # refused at handshake otherwise). Move FRAMELINK_GIT_TAG to update it, or
 # point FRAMELINK_DIR at a local checkout, as vkrender does.
-set(FRAMELINK_GIT_TAG "3ba77d4a3d493d51c622397b7b5ff3ead4bddf6d" CACHE STRING
-    "framelink revision to fetch and build (master, 2026-11-03)")
+set(FRAMELINK_GIT_TAG "c6d7db75cfdbf953bc0d9a5b4c3e5ffe49e3c43d" CACHE STRING
+    "framelink revision to fetch and build (master, 2026-11-17: M6 Windows API freeze)")
 set(FRAMELINK_DIR "" CACHE PATH
     "Build this framelink checkout instead of fetching FRAMELINK_GIT_TAG")
 # Library only: no self-tests, no samples, and no GStreamer plugin - the
