@@ -9,6 +9,11 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Same build-tree layout as vkrender on every generator: executables and DLLs
+# in build/<config>/ (build/Release in CI). The generator expression makes
+# single-config Ninja match multi-config Visual Studio.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>")
+
 # ---- GStreamer (decode) + OpenSSL (pairing crypto, bundled with GStreamer) --
 # Install the MSVC 1.0 runtime + development MSIs from
 # https://gstreamer.freedesktop.org/download/ .

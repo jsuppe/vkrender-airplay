@@ -7,7 +7,7 @@ on:
 
 jobs:
   windows:
-    runs-on: windows-latest
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
 
@@ -42,13 +42,19 @@ jobs:
           "GSTREAMER_1_0_ROOT_MSVC_X86_64=$root" >> $env:GITHUB_ENV
           "$root\bin" >> $env:GITHUB_PATH
 
-      # framelink is fetched and built from source at the revision pinned in
-      # CMakeLists.txt (FRAMELINK_GIT_TAG); nothing else is needed.
+      - name: MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Same presets and steps as framelink and vkrender. framelink is fetched
+      # and built from source at the revision pinned in CMakeLists.txt
+      # (FRAMELINK_GIT_TAG); nothing else is needed.
       - name: Configure
-        run: cmake -S . -B build -A x64
+        run: cmake --preset ci
 
       - name: Build
-        run: cmake --build build --config Release --parallel 4
+        run: cmake --build --preset ci
 
       - uses: actions/upload-artifact@v4
         with:
