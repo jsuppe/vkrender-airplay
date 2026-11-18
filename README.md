@@ -33,8 +33,9 @@ receiver redials).
   textures share one device; a `GstD3D11Converter` renders NV12 → BGRA directly
   into the acquired ring texture, and framelink's ready-fence signal is queued
   behind that draw on the same immediate context. Latest-wins throughout
-  (`appsink max-buffers=1 drop=true`, framelink's full-ring drop), so a slow
-  consumer never adds queueing latency.
+  (`appsink max-buffers=4 drop=true`, framelink's full-ring drop). Every pump
+  pass drains all ready frames into the ring, so the 4-frame sink absorbs the
+  decoder's bursts without holding the newest frame back by frame periods.
 - Multi-presenter: every sender gets its own decoder and its own slot (tile).
 - Stream lifecycle: a slot is taken when the mirror starts and sized to the
   mirror's true resolution on the first decoded frame; stopping the mirror
@@ -105,24 +106,21 @@ vkr_airplay.exe --selftest 120 mypipe
 ```
 
 Current result on an RTX 5090 with GStreamer 1.28 (2026-11-17, framelink pin
-`c6d7db7`): the **CPU path passes** (59 of 60 live). The **GPU path reports
-FAIL**: 54–56 of 60 frames reach the ring, and the test allows a shortfall of
-2. The previous framelink pin `3ba77d4` gives the same 55–56, so this is not a
-framelink change. No drops are counted at the ring, and end-of-stream flushes
-only one more frame out of the decoder, so the missing frames never leave the
-decode pipeline.
+`c6d7db7`, vkrender `008a275`): both paths pass. The **GPU path** delivered 58
+of 60 frames in 8 of 8 runs, and the **CPU path** 58 of 60 in 2 of 2 (the test
+allows a shortfall of 2).
 
-Likely cause: the GPU pipeline ends in `appsink max-buffers=1 drop=true`
-(latest frame wins, by design for a live mirror). When the hardware decoder
-emits two frames between pulls, the older one is replaced before it is
-counted. An earlier diagnostic build with a deeper sink delivered 58–59 and
-passed. The CPU pipeline keeps 4 buffers. Whether to deepen the GPU sink
-(adding up to a few frames of latency) or relax the test for the GPU path is
-an open decision.
+Until 2026-11-17 the GPU path failed with 54–56 of 60, because its appsink kept
+only 1 decoded frame. `d3d11h264dec` emits frames in bursts, and when two
+landed between pump passes the older one was dropped before it reached the
+ring. Measured on the same machine, with 6 runs per depth:
 
-```
-selftest: FAIL - 60 AUs pushed, 56 decoded live (+1 only flushed by EOS), 0 ring-full drops, 56 frames delivered to the ring (1280x720 BGRA, generation 4) via the GPU zero-copy path
-```
+| GPU sink depth | Frames delivered (of 60) | Runs passing |
+|---|---|---|
+| 1 (previous) | 55–56 | 0 of 6 |
+| 2 | 56–57 | 0 of 6 |
+| 3 | 57–58 | 2 of 6 |
+| 4 (now, same as the CPU path) | 58 | 6 of 6 |
 
 The log says which decode path each presenter got:
 

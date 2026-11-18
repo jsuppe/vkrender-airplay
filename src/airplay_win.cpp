@@ -149,6 +149,16 @@ std::vector<Session*> g_sessions; // owned; reaped on the pump thread
 //        One UpdateSubresource per frame into the ring texture. Kept for
 //        machines without a D3D11 video device; never chosen silently.
 
+// Decoded frames the appsink may hold between pump passes, on both paths.
+// Still latest-wins: drop=true discards the oldest frame beyond this, and each
+// pump pass (every 4 ms) drains every ready frame into the ring, so a backlog
+// costs the newest frame only the queued GPU colour passes ahead of it, not
+// frame periods. 1 was too shallow: d3d11h264dec emits frames in bursts, and
+// the older of two frames landing between passes was dropped before it was
+// counted (self-test on an RTX 5090: 55-56 of 60 at 1, 56-57 at 2, 57-58 at 3,
+// 58 at 4 - the CPU path's depth, which delivers 58-59).
+#define VKR_SINK_BUFFERS "4"
+
 enum class DecodeMode { Gpu, Cpu };
 DecodeMode g_decodeMode = DecodeMode::Gpu;
 
@@ -250,13 +260,12 @@ bool buildGpuPipeline(Session* s) {
     // compliance=flexible: intended to stop the decoder holding pictures back
     // for reordering, since a mirror has no B-frames. Its benefit is unproven:
     // the self-test on caspar delivered 55/60 frames with and without it.
-    // max-buffers=1 drop=true: a mirror is latest-wins; never queue behind us.
     const char* desc =
         "appsrc name=src is-live=true format=time do-timestamp=true "
         "  caps=video/x-h264,stream-format=byte-stream,alignment=au ! "
         "h264parse ! d3d11h264dec compliance=flexible ! "
         "video/x-raw(memory:D3D11Memory),format=NV12 ! "
-        "appsink name=sink max-buffers=1 drop=true sync=false enable-last-sample=false";
+        "appsink name=sink max-buffers=" VKR_SINK_BUFFERS " drop=true sync=false enable-last-sample=false";
     GstContext* ctx = gst_d3d11_context_new(s->gstDevice);
     const bool ok = launch(s, desc, ctx);
     gst_context_unref(ctx);
@@ -273,7 +282,7 @@ bool buildCpuPipeline(Session* s) {
         "appsrc name=src is-live=true format=time do-timestamp=true "
         "  caps=video/x-h264,stream-format=byte-stream,alignment=au ! "
         "h264parse ! avdec_h264 ! videoconvert ! "
-        "video/x-raw,format=BGRA ! appsink name=sink max-buffers=4 drop=true sync=false";
+        "video/x-raw,format=BGRA ! appsink name=sink max-buffers=" VKR_SINK_BUFFERS " drop=true sync=false";
     if (!launch(s, desc, nullptr)) return false;
     s->gpu = false;
     return true;
@@ -651,7 +660,7 @@ int runSelfTest(int frames) {
     ULONGLONG lastAu = GetTickCount64();
     for (;;) {
         // Same cadence as main(): drain decoded frames every few ms whether or
-        // not an access unit arrived. With appsink max-buffers=1 a pump that
+        // not an access unit arrived. With a shallow appsink a pump that
         // only ran per AU would itself drop frames and blame the GPU path.
         GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(encSink), 4 * GST_MSECOND);
         if (sample) {
